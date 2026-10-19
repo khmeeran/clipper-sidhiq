@@ -8,7 +8,8 @@ import {
   Info,
   ChevronDown,
   ChevronUp,
-  ShieldCheck
+  ShieldCheck,
+  FolderOpen
 } from 'lucide-react';
 import { LocalJob, LocalRenderedClip } from '../types';
 
@@ -67,6 +68,18 @@ export const ResultsGrid: React.FC<ResultsGridProps> = ({
                 <Archive className="w-4 h-4" />
                 <span>Download All (ZIP)</span>
               </a>
+            )}
+
+            {window.electronAPI?.isDesktop && (
+              <button
+                type="button"
+                onClick={() => window.electronAPI?.openFolder('')}
+                className="px-4 py-2.5 rounded-xl bg-white/10 hover:bg-white/15 text-white font-semibold text-sm border border-white/10 flex items-center space-x-2 transition-all active:scale-[0.98]"
+                title="Open Output Folder in Windows Explorer"
+              >
+                <FolderOpen className="w-4 h-4 text-cyan-400" />
+                <span>Open Output Folder</span>
+              </button>
             )}
 
             <button

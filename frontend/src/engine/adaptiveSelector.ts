@@ -16,19 +16,21 @@ export function adaptivelySelectClips(
   options: {
     minScore?: number;
     maxMergeDuration?: number;
+    maxClips?: number;
   } = {}
 ): CandidateClip[] {
   const minScore = options.minScore ?? 6.5;
-  const maxMergeDuration = options.maxMergeDuration ?? 75.0;
+  const maxMergeDuration = options.maxMergeDuration ?? 45.0; // Strictly under 60s
+  const maxClips = options.maxClips ?? 2; // Target 2 clips
 
   if (candidates.length === 0) return [];
 
   // 1. Filter by minimum score
   let qualified = candidates.filter(c => c.score >= minScore);
 
-  // If strict threshold filters everything, take top 1-2 candidates
+  // If strict threshold filters everything, take top candidates up to maxClips
   if (qualified.length === 0 && candidates.length > 0) {
-    qualified = [candidates[0]];
+    qualified = candidates.slice(0, Math.min(maxClips, candidates.length));
   }
 
   // 2. Sort chronologically by start_time
@@ -53,7 +55,8 @@ export function adaptivelySelectClips(
       const mergedEnd = Math.max(prev.end_time, curr.end_time);
       const mergedDur = mergedEnd - mergedStart;
 
-      if (mergedDur <= maxMergeDuration) {
+      // Only merge if within maxMergeDuration AND will not eliminate desired multi-clip diversity
+      if (mergedDur <= maxMergeDuration && selected.length >= maxClips) {
         // Merge into single cohesive clip
         selected[selected.length - 1] = {
           id: `clip_${Math.round(mergedStart)}_${Math.round(mergedEnd)}`,
@@ -68,18 +71,63 @@ export function adaptivelySelectClips(
           score: Number(Math.max(prev.score, curr.score).toFixed(1))
         };
       } else {
-        // Keep higher scored candidate
-        if (curr.score > prev.score) {
+        // If not merging, keep higher scored candidate if replacing the last one, or add if distinct
+        if (curr.score > prev.score && selected.length === 1 && qualified.length === 1) {
           selected[selected.length - 1] = { ...curr };
         }
       }
     } else {
-      selected.push({ ...curr });
+      if (selected.length < maxClips) {
+        selected.push({ ...curr });
+      }
+    }
+  }
+
+  // If only 1 clip was selected but it is >= 20s and maxClips >= 2,
+  // split into 2 high-energy punchy clips under 60 seconds each
+  if (selected.length === 1 && maxClips >= 2 && selected[0].duration >= 20.0) {
+    const orig = selected[0];
+    const halfDur = Number((orig.duration / 2).toFixed(1));
+    const clip1End = Number((orig.start_time + Math.min(18.0, halfDur)).toFixed(1));
+    const clip2Start = Number((orig.start_time + Math.max(halfDur, orig.duration - 18.0)).toFixed(1));
+    const clip2End = orig.end_time;
+    
+    selected.length = 0;
+    selected.push({
+      ...orig,
+      id: 'clip_1',
+      start_time: orig.start_time,
+      end_time: clip1End,
+      duration: Number((clip1End - orig.start_time).toFixed(1)),
+      title: `${orig.title} (Part 1)`,
+      hook: orig.hook,
+      score: orig.score
+    });
+    selected.push({
+      ...orig,
+      id: 'clip_2',
+      start_time: clip2Start,
+      end_time: clip2End,
+      duration: Number((clip2End - clip2Start).toFixed(1)),
+      title: `${orig.title} (Part 2)`,
+      hook: 'Continuation & climax',
+      score: Number(Math.max(6.5, orig.score - 0.2).toFixed(1))
+    });
+  }
+
+  // 4. Enforce maxClips limit
+  const limited = selected.slice(0, maxClips);
+
+  // 5. Ensure all selected clips are strictly under 60 seconds
+  for (const c of limited) {
+    if (c.duration >= 60.0) {
+      c.end_time = Number((c.start_time + 59.0).toFixed(1));
+      c.duration = 59.0;
     }
   }
 
   // Assign clean sequential IDs
-  return selected.map((c, idx) => ({
+  return limited.map((c, idx) => ({
     ...c,
     id: `clip_${idx + 1}`
   }));

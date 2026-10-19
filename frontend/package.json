@@ -3,11 +3,38 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "main": "electron/main.cjs",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "electron:dev": "electron . --dev",
+    "electron:start": "electron .",
+    "pack:desktop": "electron-builder --win --dir",
+    "dist:desktop": "electron-builder --win"
+  },
+  "build": {
+    "appId": "com.clippersidhiq.app",
+    "productName": "Clipper Sidhiq",
+    "directories": {
+      "output": "dist-desktop"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "bin",
+        "to": "bin",
+        "filter": ["**/*"]
+      }
+    ],
+    "win": {
+      "target": ["dir"]
+    }
   },
   "dependencies": {
     "clsx": "^2.1.1",
@@ -25,6 +52,8 @@
     "@types/react-dom": "^19.2.7",
     "@vitejs/plugin-react": "^6.1.1",
     "autoprefixer": "^10.6.1",
+    "electron": "^44.9.0",
+    "electron-builder": "^26.15.3",
     "oxlint": "^1.81.0",
     "postcss": "^8.5.31",
     "puppeteer-core": "^25.14.0",

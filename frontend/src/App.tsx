@@ -1,256 +1,292 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Sidebar } from './components/Sidebar';
-import { UploadWorkspace } from './components/UploadWorkspace';
-import { ProcessingView } from './components/ProcessingView';
-import { ResultsGrid } from './components/ResultsGrid';
-import { VideoPlayerModal } from './components/VideoPlayerModal';
-import { SettingsModal } from './components/SettingsModal';
+import { Navbar } from './components/Navbar';
+import { HeroWorkspace } from './components/HeroWorkspace';
+import { HowItWorksSection } from './components/HowItWorksSection';
+import { ProcessingWorkspace } from './components/ProcessingWorkspace';
+import { ResultsWorkspace } from './components/ResultsWorkspace';
 import { HistoryWorkspace } from './components/HistoryWorkspace';
-import { LocalJob, LocalRenderedClip, BrowserSystemStatus, ClientSettings } from './types';
-import { ClientClipperPipeline } from './engine/clientOrchestrator';
+import { PrivacySection } from './components/PrivacySection';
 import { 
-  getBrowserStorageEstimate, 
-  loadJobsFromIndexedDB, 
-  deleteJobFromIndexedDB, 
-  performRetentionCleanup 
-} from './engine/storageManager';
+  checkBridgeHealth, 
+  startCreateClipsPipeline, 
+  getPipelineJobStatus, 
+  cancelPipelineJob, 
+  getCompletedProjectsList, 
+  uploadLocalFileToBridge,
+  BridgeStatus, 
+  PipelineJob, 
+  CompletedProject 
+} from './api/bridgeClient';
 
 export function App() {
-  const [currentTab, setCurrentTab] = useState<'upload' | 'queue' | 'history' | 'processing' | 'results'>('upload');
-  const [jobs, setJobs] = useState<LocalJob[]>([]);
-  const [activeJobId, setActiveJobId] = useState<string | null>(null);
-  const [currentJob, setCurrentJob] = useState<LocalJob | null>(null);
-  const [currentClips, setCurrentClips] = useState<LocalRenderedClip[]>([]);
-  
-  const [systemStatus, setSystemStatus] = useState<BrowserSystemStatus | null>(null);
-  const [settings, setSettings] = useState<ClientSettings>({
-    reframing_mode: 'blur_background',
-    subtitle_style: 'violet_glow',
-    min_clip_score: 6.5,
-    margin_v: 380,
-    retention_hours: 6.0
-  });
-
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [playingClip, setPlayingClip] = useState<LocalRenderedClip | null>(null);
-  const [isProcessing, setIsProcessing] = useState(false);
-
-  const activePipelineRef = useRef<ClientClipperPipeline | null>(null);
+  const [currentTab, setCurrentTab] = useState<'create' | 'history' | 'how-it-works' | 'privacy'>('create');
+  const [viewState, setViewState] = useState<'hero' | 'processing' | 'results'>('hero');
+  const [bridgeStatus, setBridgeStatus] = useState<BridgeStatus | null>(null);
+  const [savedProjects, setSavedProjects] = useState<CompletedProject[]>([]);
+  const [currentJob, setCurrentJob] = useState<PipelineJob | null>(null);
+  const pollingTimerRef = useRef<any>(null);
 
   useEffect(() => {
-    // 1. Check browser capabilities and storage
-    updateSystemStatus();
+    // 1. Initial health check
+    checkBridgeHealth().then(status => {
+      setBridgeStatus(status);
+    });
 
-    // 2. Load cached jobs from IndexedDB
-    loadSavedJobs();
+    // 2. Load existing projects
+    loadProjects();
 
-    // 3. Best-effort retention cleanup for jobs older than 6 hours
-    performRetentionCleanup(settings.retention_hours);
+    // 3. Periodic health refresh
+    const healthInterval = setInterval(() => {
+      checkBridgeHealth().then(setBridgeStatus);
+    }, 8000);
+
+    return () => {
+      clearInterval(healthInterval);
+      if (pollingTimerRef.current) clearInterval(pollingTimerRef.current);
+    };
   }, []);
 
-  const updateSystemStatus = async () => {
-    const storage = await getBrowserStorageEstimate();
-    const hasWebCodecs = typeof window !== 'undefined' && 'VideoEncoder' in window;
-    const hasWebAudio = typeof window !== 'undefined' && ('AudioContext' in window || 'webkitAudioContext' in window);
-    const hasSpeech = typeof window !== 'undefined' && ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window);
-
-    setSystemStatus({
-      webCodecsSupported: hasWebCodecs,
-      webAudioSupported: hasWebAudio,
-      speechRecognitionSupported: hasSpeech,
-      storageUsageMB: storage.usageMB,
-      storageQuotaMB: storage.quotaMB,
-      storagePercentUsed: storage.percentUsed,
-      engine: hasWebCodecs ? 'WebCodecs Hardware (Client)' : 'Canvas + MediaRecorder (Client)'
-    });
-  };
-
-  const loadSavedJobs = async () => {
+  const loadProjects = async () => {
     try {
-      const saved = await loadJobsFromIndexedDB();
-      if (saved && saved.length > 0) {
-        const mapped: LocalJob[] = saved.map(s => ({
-          id: s.id,
-          filename: s.filename,
-          status: 'COMPLETED',
-          stage: 'COMPLETED',
-          progress_percent: 100,
-          stage_message: 'Completed in previous session',
-          duration: s.duration,
-          resolution: s.resolution,
-          file_size_bytes: s.file_size_bytes,
-          created_at: s.created_at,
-          completed_at: s.completed_at,
-          clip_count: s.clip_count,
-          clips: s.clips || []
-        }));
-        setJobs(mapped);
-      }
+      const list = await getCompletedProjectsList();
+      setSavedProjects(list);
     } catch (_) {}
   };
 
-  const handleStartProcessing = async (file: File, options: Record<string, any>) => {
-    setIsProcessing(true);
-    const pipeline = new ClientClipperPipeline();
-    activePipelineRef.current = pipeline;
+  const startJobPolling = (jobId: string) => {
+    if (pollingTimerRef.current) clearInterval(pollingTimerRef.current);
 
-    setCurrentTab('processing');
+    let consecutiveErrors = 0;
 
-    try {
-      const completedJob = await pipeline.run(
-        file,
-        {
-          reframingMode: options.reframingMode || settings.reframing_mode,
-          subtitleStyle: options.subtitleStyle || settings.subtitle_style,
-          minScore: options.minScore || settings.min_clip_score,
-        },
-        (updatedJob) => {
-          setCurrentJob({ ...updatedJob });
-          setActiveJobId(updatedJob.id);
-          setJobs(prev => {
-            const idx = prev.findIndex(j => j.id === updatedJob.id);
-            if (idx !== -1) {
-              const copy = [...prev];
-              copy[idx] = { ...updatedJob };
-              return copy;
-            }
-            return [updatedJob, ...prev];
-          });
+    pollingTimerRef.current = setInterval(async () => {
+      const res = await getPipelineJobStatus(jobId);
+      if (res.ok && res.job) {
+        consecutiveErrors = 0;
+        setCurrentJob(res.job);
+
+        if (res.job.status === 'COMPLETED') {
+          clearInterval(pollingTimerRef.current);
+          pollingTimerRef.current = null;
+          setViewState('results');
+          loadProjects();
+        } else if (res.job.status === 'FAILED' || res.job.status === 'CANCELLED') {
+          clearInterval(pollingTimerRef.current);
+          pollingTimerRef.current = null;
         }
-      );
-
-      setCurrentJob(completedJob);
-      setCurrentClips(completedJob.clips);
-      setActiveJobId(completedJob.id);
-      setIsProcessing(false);
-      updateSystemStatus();
-    } catch (err: any) {
-      setIsProcessing(false);
-      console.error('In-browser processing error:', err);
-    }
+      } else {
+        consecutiveErrors++;
+        // If companion bridge is temporarily unreachable, show recovery status without aborting immediately
+        if (consecutiveErrors >= 4 && consecutiveErrors < 30) {
+          setCurrentJob(prev => prev ? {
+            ...prev,
+            stageMessage: `Companion connection interrupted (attempt ${consecutiveErrors}/30). Reconnecting...`
+          } : null);
+        } else if (consecutiveErrors >= 30) {
+          clearInterval(pollingTimerRef.current);
+          pollingTimerRef.current = null;
+          setCurrentJob(prev => prev ? {
+            ...prev,
+            status: 'FAILED',
+            stageMessage: 'Lost connection to Companion Bridge. Please ensure start_web.bat is running and try again.',
+            error: 'Companion service stopped responding.'
+          } : null);
+        }
+      }
+    }, 800);
   };
 
-  const handleCancelJob = () => {
-    if (activePipelineRef.current) {
-      activePipelineRef.current.cancel();
-      activePipelineRef.current = null;
+  const handleSubmitUrl = async (url: string) => {
+    // If bridge is offline, alert user
+    if (bridgeStatus && !bridgeStatus.online) {
+      alert('Local Companion Bridge is offline. Please run start_web.bat or start.bat in the project directory to launch the engine.');
+      return;
     }
-    setIsProcessing(false);
-    if (currentJob) {
-      const cancelled = {
-        ...currentJob,
-        status: 'CANCELLED' as const,
-        stage: 'CANCELLED' as const,
-        stage_message: 'Processing cancelled by user'
-      };
-      setCurrentJob(cancelled);
-    }
-  };
 
-  const handleClearJob = async (jobId: string) => {
-    await deleteJobFromIndexedDB(jobId);
-    setJobs(prev => prev.filter(j => j.id !== jobId));
-    if (activeJobId === jobId) {
-      setActiveJobId(null);
-      setCurrentJob(null);
-      setCurrentClips([]);
-      setCurrentTab('upload');
-    }
-    updateSystemStatus();
-  };
+    setViewState('processing');
+    setCurrentJob({
+      id: `pending_${Date.now()}`,
+      status: 'RUNNING',
+      stage: 'DOWNLOADING',
+      stageMessage: 'Initializing downloader with bundled yt-dlp & FFmpeg...',
+      percent: 5,
+      videoName: url.includes('v=') ? 'YouTube Video' : 'Online Video'
+    });
 
-  const handleSelectJob = (jobId: string) => {
-    const j = jobs.find(item => item.id === jobId);
-    if (!j) return;
-    setActiveJobId(jobId);
-    setCurrentJob(j);
-    setCurrentClips(j.clips || []);
-    if (j.status === 'COMPLETED') {
-      setCurrentTab('results');
+    const res = await startCreateClipsPipeline(url);
+    if (res.ok && res.jobId) {
+      startJobPolling(res.jobId);
     } else {
-      setCurrentTab('processing');
+      setCurrentJob(prev => ({
+        id: prev?.id || 'error',
+        status: 'FAILED',
+        stage: 'FAILED',
+        stageMessage: 'Failed to initiate download.',
+        percent: 0,
+        error: res.error || 'Could not connect to downloader.'
+      }));
     }
   };
 
-  const activeCount = jobs.filter((j) => j.status === 'RUNNING' || j.status === 'QUEUED').length;
-  const completedCount = jobs.filter((j) => j.status === 'COMPLETED').length;
+  const handleUploadFile = async (file: File) => {
+    if (bridgeStatus && !bridgeStatus.online) {
+      alert('Local Companion Bridge is offline. Please run start_web.bat or start.bat in the project directory to enable local processing.');
+      return;
+    }
+
+    setViewState('processing');
+    setCurrentJob({
+      id: `pending_${Date.now()}`,
+      status: 'RUNNING',
+      stage: 'DOWNLOADING',
+      stageMessage: `Uploading local file: ${file.name}...`,
+      percent: 10,
+      videoName: file.name
+    });
+
+    const uploadRes = await uploadLocalFileToBridge(file);
+    if (!uploadRes.ok || !uploadRes.filePath) {
+      setCurrentJob(prev => ({
+        id: prev?.id || 'error',
+        status: 'FAILED',
+        stage: 'FAILED',
+        stageMessage: 'Local file upload failed.',
+        percent: 0,
+        error: uploadRes.error || 'Failed to stage file for clipping.'
+      }));
+      return;
+    }
+
+    const res = await startCreateClipsPipeline('', uploadRes.filePath);
+    if (res.ok && res.jobId) {
+      startJobPolling(res.jobId);
+    } else {
+      setCurrentJob(prev => ({
+        id: prev?.id || 'error',
+        status: 'FAILED',
+        stage: 'FAILED',
+        stageMessage: 'Failed to start clipping engine.',
+        percent: 0,
+        error: res.error || 'Could not start processing.'
+      }));
+    }
+  };
+
+  const handleCancelJob = async () => {
+    if (currentJob?.id) {
+      if (pollingTimerRef.current) clearInterval(pollingTimerRef.current);
+      pollingTimerRef.current = null;
+      await cancelPipelineJob(currentJob.id);
+      setCurrentJob(prev => prev ? {
+        ...prev,
+        status: 'CANCELLED',
+        stage: 'CANCELLED',
+        stageMessage: 'Processing cancelled by user.'
+      } : null);
+    }
+  };
+
+  const handleSelectSavedProject = (job: PipelineJob) => {
+    setCurrentJob(job);
+    setViewState('results');
+    setCurrentTab('create');
+  };
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-[#090a0f] text-gray-100 font-sans">
-      {/* Sidebar */}
-      <Sidebar
-        currentTab={currentTab === 'processing' || currentTab === 'results' ? 'queue' : currentTab}
-        onSelectTab={(tab) => setCurrentTab(tab)}
-        onOpenSettings={() => setIsSettingsOpen(true)}
-        systemStatus={systemStatus}
-        activeCount={activeCount}
-        completedCount={completedCount}
+    <div className="min-h-screen bg-[#090a0f] text-gray-100 flex flex-col font-sans selection:bg-violet-600 selection:text-white">
+      {/* Top Navbar */}
+      <Navbar
+        currentTab={currentTab}
+        onSelectTab={(tab) => {
+          setCurrentTab(tab);
+          if (tab === 'create' && viewState !== 'processing') {
+            // Keep results if available, else hero
+          }
+        }}
+        bridgeStatus={bridgeStatus}
+        savedCount={savedProjects.length}
       />
 
-      {/* Main Workspace Area */}
-      <main className="flex-1 h-full overflow-y-auto bg-gradient-to-b from-[#090a0f] via-[#0b0d13] to-[#08090d]">
-        {currentTab === 'upload' && (
-          <UploadWorkspace
-            onStartProcessing={handleStartProcessing}
-            isProcessing={isProcessing}
-            systemStatus={systemStatus}
-            settings={settings}
-          />
+      {/* Main Workspace Body */}
+      <main className="flex-1">
+        {currentTab === 'how-it-works' && (
+          <div className="py-8">
+            <HowItWorksSection onGetStarted={() => setCurrentTab('create')} />
+          </div>
         )}
 
-        {currentTab === 'processing' && currentJob && (
-          <ProcessingView
-            job={currentJob}
-            onCancelJob={handleCancelJob}
-            onViewResults={() => setCurrentTab('results')}
-          />
+        {currentTab === 'privacy' && (
+          <div className="py-8">
+            <PrivacySection />
+          </div>
         )}
 
-        {currentTab === 'results' && currentJob && (
-          <ResultsGrid
-            job={currentJob}
-            clips={currentClips}
-            onPlayClip={(clip) => setPlayingClip(clip)}
-            onClearJob={handleClearJob}
-          />
-        )}
-
-        {(currentTab === 'queue' || currentTab === 'history') && (
+        {currentTab === 'history' && (
           <HistoryWorkspace
-            jobs={jobs}
-            filterStatus={currentTab}
-            onSelectJob={handleSelectJob}
-            onDeleteJob={handleClearJob}
+            projects={savedProjects}
+            onSelectProject={handleSelectSavedProject}
+            onCreateNew={() => {
+              setCurrentTab('create');
+              setViewState('hero');
+            }}
           />
+        )}
+
+        {currentTab === 'create' && (
+          <>
+            {viewState === 'hero' && (
+              <>
+                <HeroWorkspace
+                  onSubmitUrl={handleSubmitUrl}
+                  onUploadFile={handleUploadFile}
+                  bridgeStatus={bridgeStatus}
+                  onOpenHowItWorks={() => setCurrentTab('how-it-works')}
+                />
+                <div className="border-t border-white/[0.06] bg-[#0b0d13]/50">
+                  <HowItWorksSection />
+                </div>
+                <div className="border-t border-white/[0.06]">
+                  <PrivacySection />
+                </div>
+              </>
+            )}
+
+            {viewState === 'processing' && currentJob && (
+              <ProcessingWorkspace
+                job={currentJob}
+                onCancel={handleCancelJob}
+                onReset={() => {
+                  setViewState('hero');
+                  setCurrentJob(null);
+                }}
+              />
+            )}
+
+            {viewState === 'results' && currentJob && (
+              <ResultsWorkspace
+                job={currentJob}
+                onNewProject={() => {
+                  setViewState('hero');
+                  setCurrentJob(null);
+                }}
+              />
+            )}
+          </>
         )}
       </main>
 
-      {/* Video Preview Modal */}
-      {playingClip && (
-        <VideoPlayerModal
-          clip={playingClip}
-          onClose={() => setPlayingClip(null)}
-        />
-      )}
-
-      {/* Settings Modal */}
-      {isSettingsOpen && (
-        <SettingsModal
-          settings={settings}
-          systemStatus={systemStatus}
-          onSave={(newS) => {
-            setSettings(newS);
-            updateSystemStatus();
-          }}
-          onClose={() => setIsSettingsOpen(false)}
-          onClearedStorage={() => {
-            setJobs([]);
-            setCurrentJob(null);
-            setCurrentClips([]);
-            updateSystemStatus();
-          }}
-        />
-      )}
+      {/* Footer */}
+      <footer className="border-t border-white/[0.08] bg-[#07080c] py-8 px-4 text-center text-xs text-gray-500">
+        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4">
+          <div className="flex items-center space-x-2">
+            <span className="font-bold text-gray-300">Clipper Sidhiq</span>
+            <span>—</span>
+            <span>Automated Vertical Video Engine</span>
+          </div>
+          <div>
+            100% Local GPU/CPU Reframing & Timestamped Subtitles
+          </div>
+        </div>
+      </footer>
     </div>
   );
 }

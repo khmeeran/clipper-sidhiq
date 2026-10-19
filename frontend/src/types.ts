@@ -66,3 +66,88 @@ export interface ClientSettings {
   margin_v: number;
   retention_hours: number;
 }
+
+export interface DownloadProgressEvent {
+  taskId: string;
+  percent: number;
+  speed: string;
+  eta: string;
+  totalBytes: number;
+  filename: string;
+}
+
+export interface MediaValidationResult {
+  valid: boolean;
+  error?: string;
+  duration?: number;
+  formatName?: string;
+  bitRate?: number;
+  video?: {
+    codec: string;
+    width: number;
+    height: number;
+    fps?: number;
+  };
+  audio?: {
+    codec: string;
+    channels?: number;
+    sampleRate?: number;
+  } | null;
+}
+
+export interface ElectronEnvironment {
+  isDesktop: boolean;
+  platform: string;
+  downloadsDir: string;
+  exportsDir: string;
+  binaries: {
+    ytDlp: boolean;
+    ffmpeg: boolean;
+    ffprobe: boolean;
+    paths: {
+      ytDlp: string;
+      ffmpeg: string;
+      ffprobe: string;
+    };
+  };
+}
+
+export interface ElectronDownloadResult {
+  success: boolean;
+  error?: string;
+  cancelled?: boolean;
+  taskId?: string;
+  filePath?: string;
+  fileName?: string;
+  fileSize?: number;
+  metadata?: MediaValidationResult;
+}
+
+export interface ElectronReadFileResult {
+  success: boolean;
+  error?: string;
+  fileName?: string;
+  fileSize?: number;
+  mimeType?: string;
+  buffer?: ArrayBuffer;
+}
+
+export interface ElectronAPI {
+  isDesktop: boolean;
+  getEnvironment: () => Promise<ElectronEnvironment>;
+  selectDirectory: () => Promise<string | null>;
+  downloadVideo: (options: { url: string; downloadDir?: string }) => Promise<ElectronDownloadResult>;
+  cancelDownload: (taskId: string) => Promise<{ success: boolean; error?: string }>;
+  onDownloadProgress: (callback: (data: DownloadProgressEvent) => void) => () => void;
+  validateMedia: (filePath: string) => Promise<MediaValidationResult>;
+  readMediaFile: (filePath: string) => Promise<ElectronReadFileResult>;
+  saveClip: (options: { fileName: string; buffer: ArrayBuffer; folderPath?: string }) => Promise<{ success: boolean; savedPath?: string; folderPath?: string; error?: string }>;
+  openFolder: (targetPath: string) => Promise<{ success: boolean; error?: string }>;
+}
+
+declare global {
+  interface Window {
+    electronAPI?: ElectronAPI;
+  }
+}
+

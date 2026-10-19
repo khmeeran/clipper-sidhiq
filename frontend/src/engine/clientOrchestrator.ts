@@ -63,6 +63,7 @@ export class ClientClipperPipeline {
       reframingMode?: 'blur_background' | 'center_crop';
       subtitleStyle?: 'violet_glow' | 'radiant_gold' | 'clean_white';
       minScore?: number;
+      maxClips?: number;
     } = {},
     onUpdate?: (job: LocalJob) => void
   ): Promise<LocalJob> {
@@ -134,15 +135,17 @@ export class ClientClipperPipeline {
       // 4. Heuristic Content Intelligence & Scoring (Ollama-free)
       emit('SELECTING', 58, 'Evaluating hook strength, speech density, and pacing...');
       const candidates = discoverCandidatesHeuristically(audioResult, {
-        minDuration: 15.0,
-        maxDuration: 75.0,
+        minDuration: 8.0,
+        maxDuration: 45.0, // Keep clips under 60s
         minScore: options.minScore || 6.5
       });
 
       // 5. Adaptive Selection & Deduplication
       emit('SELECTING', 65, 'Deduplicating and adaptively selecting best moments...');
       const selectedClips = adaptivelySelectClips(candidates, {
-        minScore: options.minScore || 6.5
+        minScore: options.minScore || 6.5,
+        maxClips: options.maxClips || 2, // Target only 2 clips
+        maxMergeDuration: 45.0 // Strictly under 60s
       });
 
       if (selectedClips.length === 0) {

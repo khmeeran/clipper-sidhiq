@@ -17,5 +17,18 @@ dist/
 .env.local
 .DS_Store
 
-# Vercel
+# Vercel & builds
 .vercel/
+dist/
+dist-desktop/
+frontend/dist/
+frontend/dist-desktop/
+
+# Binaries & Downloads
+downloads/
+frontend/bin/
+*.mp4
+*.zip
+*.tar.gz
+*.mkv
+*.webm

@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { 
   UploadCloud, 
   Film, 
@@ -20,9 +20,14 @@ import {
   Download,
   Copy,
   Check,
-  Terminal
+  Terminal,
+  FolderOpen,
+  Folder,
+  XCircle,
+  Monitor,
+  Smartphone
 } from 'lucide-react';
-import { BrowserSystemStatus, ClientSettings } from '../types';
+import { BrowserSystemStatus, ClientSettings, ElectronEnvironment } from '../types';
 import { getCachedVideo, saveCachedVideo } from '../engine/storageManager';
 
 interface UploadWorkspaceProps {
@@ -118,25 +123,84 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
   const [fetchProgress, setFetchProgress] = useState<{ percent: number; loaded: number; total: number } | null>(null);
   const [downloadSpeed, setDownloadSpeed] = useState<string>('');
 
+  // Desktop Engine Detection & Preferences
+  const isDesktop = Boolean(window.electronAPI?.isDesktop);
+  const [desktopEnv, setDesktopEnv] = useState<ElectronEnvironment | null>(null);
+  const [customDownloadDir, setCustomDownloadDir] = useState<string | null>(null);
+  const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
+  const [downloadEta, setDownloadEta] = useState<string>('');
+  const [downloadedFilePath, setDownloadedFilePath] = useState<string>('');
+
+  useEffect(() => {
+    if (window.electronAPI) {
+      window.electronAPI.getEnvironment().then((env) => {
+        setDesktopEnv(env);
+        if (env.downloadsDir) setCustomDownloadDir(env.downloadsDir);
+      }).catch(console.error);
+
+      const unsubscribe = window.electronAPI.onDownloadProgress((data) => {
+        if (data.percent !== undefined) {
+          setFetchProgress({
+            percent: Math.round(data.percent),
+            loaded: data.totalBytes ? Math.round((data.totalBytes * data.percent) / 100) : 0,
+            total: data.totalBytes || 0
+          });
+        }
+        if (data.speed) setDownloadSpeed(data.speed);
+        if (data.eta) setDownloadEta(data.eta);
+        if (data.taskId) setCurrentTaskId(data.taskId);
+      });
+
+      return () => {
+        unsubscribe();
+      };
+    }
+  }, []);
+
+  const handleCancelDownload = async () => {
+    if (window.electronAPI && currentTaskId) {
+      await window.electronAPI.cancelDownload(currentTaskId);
+    }
+    setIsFetchingUrl(false);
+    setCurrentTaskId(null);
+    setFetchProgress(null);
+    setErrorMessage('Download cancelled.');
+  };
+
+  const handleSelectFolder = async () => {
+    if (window.electronAPI) {
+      const selected = await window.electronAPI.selectDirectory();
+      if (selected) {
+        setCustomDownloadDir(selected);
+      }
+    }
+  };
+
+  const handleOpenFolder = async (target?: string) => {
+    if (window.electronAPI) {
+      await window.electronAPI.openFolder(target || customDownloadDir || desktopEnv?.downloadsDir || '');
+    }
+  };
+
   // Downloaded File Local Persistence & State
   const [downloadedBlob, setDownloadedBlob] = useState<Blob | null>(null);
   const [downloadedFilename, setDownloadedFilename] = useState<string>('');
   const [isDownloadedFromUrl, setIsDownloadedFromUrl] = useState(false);
   const [isCachedDownload, setIsCachedDownload] = useState(false);
 
-  // YouTube Guidance & Architecture Proposal State
+  // YouTube Guidance & Architecture Proposal State (Web fallback)
   const [youtubeGuidance, setYoutubeGuidance] = useState<{ url: string; videoId?: string } | null>(null);
   const [copiedCommand, setCopiedCommand] = useState(false);
 
   // Custom job preferences
   const [reframingMode, setReframingMode] = useState<'blur_background' | 'center_crop'>(settings.reframing_mode || 'blur_background');
   const [subtitleStyle, setSubtitleStyle] = useState<'violet_glow' | 'radiant_gold' | 'clean_white'>(settings.subtitle_style || 'violet_glow');
-  const [minClipScore, setMinClipScore] = useState<number>(settings.min_clip_score || 6.5);
+  const [minClipScore, setMinClipScore] = useState<number>(settings.min_clip_score || 7.5);
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const handleFetchUrl = async (e?: React.FormEvent) => {
+  const handleFetchUrl = async (e?: React.FormEvent, autoStart = false) => {
     if (e) e.preventDefault();
     setErrorMessage(null);
     setYoutubeGuidance(null);
@@ -152,6 +216,80 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
       return;
     }
 
+    // ----------------------------------------------------
+    // 1. DESKTOP MODE: Native Local Ingestion via Bundled Binaries
+    // ----------------------------------------------------
+    if (window.electronAPI?.isDesktop) {
+      setIsFetchingUrl(true);
+      setFetchProgress({ percent: 0, loaded: 0, total: 0 });
+      setDownloadSpeed('Initializing downloader...');
+      setDownloadEta('');
+      setIsCachedDownload(false);
+
+      try {
+        const res = await window.electronAPI.downloadVideo({
+          url: trimmed,
+          downloadDir: customDownloadDir || desktopEnv?.downloadsDir
+        });
+
+        if (res.cancelled) {
+          setIsFetchingUrl(false);
+          setCurrentTaskId(null);
+          setFetchProgress(null);
+          setErrorMessage('Download cancelled.');
+          return;
+        }
+
+        if (!res.success || !res.filePath) {
+          throw new Error(res.error || 'Failed to download video.');
+        }
+
+        setCurrentTaskId(null);
+        setDownloadedFilePath(res.filePath);
+        setDownloadedFilename(res.fileName || 'downloaded_video.mp4');
+        setIsDownloadedFromUrl(true);
+
+        // Read file bytes into ArrayBuffer
+        const fileRes = await window.electronAPI.readMediaFile(res.filePath);
+        if (!fileRes.success || !fileRes.buffer) {
+          throw new Error(fileRes.error || 'Failed to read downloaded video file into memory.');
+        }
+
+        const file = new File([fileRes.buffer], res.fileName || 'video.mp4', { type: 'video/mp4' });
+        setSelectedFile(file);
+
+        if (res.metadata?.valid && res.metadata.video) {
+          setVideoPreview({
+            duration: res.metadata.duration || 0,
+            width: res.metadata.video.width,
+            height: res.metadata.video.height
+          });
+        }
+
+        setVideoUrl('');
+
+        if (autoStart) {
+          await onStartProcessing(file, {
+            reframingMode,
+            subtitleStyle,
+            minScore: minClipScore
+          });
+        }
+      } catch (err: any) {
+        console.error('Desktop URL download failed:', err);
+        setSelectedFile(null);
+        setIsDownloadedFromUrl(false);
+        setErrorMessage(err.message || 'Desktop video download failed.');
+      } finally {
+        setIsFetchingUrl(false);
+        setFetchProgress(null);
+      }
+      return;
+    }
+
+    // ----------------------------------------------------
+    // 2. WEB BROWSER / VERCEL MODE (Static Web Logic)
+    // ----------------------------------------------------
     const lower = trimmed.toLowerCase();
     if (lower.includes('youtube.com') || lower.includes('youtu.be')) {
       let videoId = '';
@@ -397,15 +535,18 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
     <div className="max-w-4xl mx-auto py-8 px-6 space-y-8">
       {/* Header */}
       <div className="text-center space-y-3">
-        <div className="inline-flex items-center space-x-2 px-3.5 py-1 rounded-full bg-cyan-500/10 border border-cyan-500/20 text-cyan-300 text-xs font-medium">
-          <ShieldCheck className="w-3.5 h-3.5" />
-          <span>100% In-Browser Engine • Zero Cloud Upload • Vercel Accessible</span>
+        <div className="inline-flex items-center space-x-2 px-3.5 py-1.5 rounded-full bg-purple-500/10 border border-purple-500/20 text-purple-300 text-xs font-semibold tracking-wide">
+          <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
+          <span>AI Video Clipping Studio • 100% On-Device Processing</span>
         </div>
-        <h1 className="text-4xl sm:text-5xl font-extrabold tracking-tight text-white">
-          Turn Long Videos Into <span className="bg-gradient-to-r from-purple-400 via-indigo-300 to-cyan-400 bg-clip-text text-transparent">Moments That Matter</span>
+        <h1 className="text-3xl sm:text-5xl font-extrabold tracking-tight text-white leading-tight">
+          Turn Long Videos Into{' '}
+          <span className="bg-gradient-to-r from-purple-400 via-indigo-300 to-cyan-300 bg-clip-text text-transparent">
+            Ready-to-Share Clips
+          </span>
         </h1>
-        <p className="text-gray-400 text-base max-w-2xl mx-auto">
-          Speech envelope analysis, silence gating, intelligent viral moment discovery, and 9:16 vertical reframing — rendered directly on your device.
+        <p className="text-gray-400 text-sm sm:text-base max-w-2xl mx-auto leading-relaxed">
+          Transform your podcasts, interviews, and long videos into engaging vertical clips for YouTube Shorts, Instagram Reels, and TikTok — fast, private, and rendered directly on your device.
         </p>
       </div>
 
@@ -449,7 +590,7 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
         </div>
       )}
 
-      {/* YouTube Stream Guidance & Architecture Notice */}
+      {/* YouTube Link Guidance Notice */}
       {youtubeGuidance && !selectedFile && (
         <div data-testid="youtube-guidance-panel" className="rounded-2xl p-6 bg-[#13151f] border border-purple-500/30 space-y-4 shadow-xl">
           <div className="flex items-start justify-between">
@@ -458,37 +599,40 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
                 <Globe className="w-5 h-5" />
               </div>
               <div>
-                <h4 className="font-semibold text-white text-sm">YouTube Stream Ingestion Notice</h4>
-                <p className="text-xs text-gray-400">Target URL: <span className="text-purple-300 font-mono truncate max-w-sm inline-block align-bottom">{youtubeGuidance.url}</span></p>
+                <h4 className="font-semibold text-white text-sm">YouTube Link Notice</h4>
+                <p className="text-xs text-gray-400">Target URL: <span className="text-purple-300 font-mono truncate max-w-xs sm:max-w-md inline-block align-bottom">{youtubeGuidance.url}</span></p>
               </div>
             </div>
             <button
               onClick={() => setYoutubeGuidance(null)}
-              className="text-xs text-gray-400 hover:text-white px-2 py-1 rounded bg-white/5 hover:bg-white/10"
+              className="text-xs text-gray-400 hover:text-white px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/10 transition-colors"
             >
               Dismiss
             </button>
           </div>
 
-          <div className="p-4 rounded-xl bg-black/40 border border-white/5 space-y-2 text-xs text-gray-300 leading-relaxed">
-            <p className="font-semibold text-purple-300">Why YouTube URLs cannot be directly downloaded by a browser:</p>
-            <ul className="list-disc list-inside space-y-1 text-gray-400 pl-1">
-              <li><strong className="text-gray-300">No static video file:</strong> YouTube watch pages deliver HTML and separate DASH video & audio streams from dynamic subdomains of <code className="text-purple-300">googlevideo.com</code>.</li>
-              <li><strong className="text-gray-300">Browser CORS enforcement:</strong> Google strictly enforces Cross-Origin Resource Sharing on <code className="text-purple-300">googlevideo.com</code>, forbidding client web browsers from fetching media segments.</li>
-              <li><strong className="text-gray-300">Rotating cipher signatures:</strong> YouTube requires dynamic JavaScript de-obfuscation algorithms that cannot execute inside an isolated browser sandbox.</li>
-            </ul>
+          <div className="p-4 rounded-xl bg-black/40 border border-white/5 space-y-1.5 text-xs text-gray-300 leading-relaxed">
+            <p className="font-semibold text-purple-300">Why YouTube links require a local video file in web browsers:</p>
+            <p className="text-gray-400">
+              YouTube streams video and audio as separate dynamic data chunks rather than a single static file, and web browsers prevent direct media downloading to protect video content.
+            </p>
           </div>
 
           <div className="p-4 rounded-xl bg-purple-950/20 border border-purple-500/20 space-y-3">
             <div className="flex items-center space-x-2 text-xs text-purple-200 font-medium">
-              <Terminal className="w-4 h-4 text-purple-400" />
-              <span>Smallest Compliant Architecture Solution — Local Fetcher Companion:</span>
+              <Check className="w-4 h-4 text-cyan-400" />
+              <span>Two Simple Ways to Process This Video:</span>
             </div>
-            <p className="text-xs text-gray-400">
-              Run this one-click command in your project terminal to download the genuine 1080p MP4 file to your disk:
-            </p>
-            <div className="flex items-center space-x-2 bg-black/60 p-2.5 rounded-lg border border-white/10 font-mono text-xs text-purple-300 overflow-x-auto">
-              <span className="flex-1 select-all">python tools/fetch_youtube.py "{youtubeGuidance.url}"</span>
+            <div className="space-y-2 text-xs text-gray-300 pl-1">
+              <p>
+                <strong className="text-white">1. Desktop App:</strong> In <span className="text-purple-300 font-semibold">Clipper Sidhiq Desktop</span>, videos download automatically with one click.
+              </p>
+              <p>
+                <strong className="text-white">2. Web Browser:</strong> Save the video file to your computer first, then drop it into the <button type="button" onClick={() => { setYoutubeGuidance(null); setUploadMode('local'); }} className="text-cyan-400 hover:underline font-semibold">Local File Upload</button> tab.
+              </p>
+            </div>
+            <div className="pt-2 border-t border-white/5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 text-xs text-gray-400">
+              <span className="text-[11px] text-gray-500">Need help saving a copy? You can also use the companion tool:</span>
               <button
                 type="button"
                 onClick={() => {
@@ -496,24 +640,10 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
                   setCopiedCommand(true);
                   setTimeout(() => setCopiedCommand(false), 2500);
                 }}
-                className="px-3 py-1 rounded bg-purple-600/30 hover:bg-purple-600/50 text-purple-200 font-sans text-xs flex items-center space-x-1.5 transition-colors border border-purple-500/30 flex-shrink-0"
+                className="px-2.5 py-1 rounded bg-purple-600/30 hover:bg-purple-600/50 text-purple-200 font-sans text-xs flex items-center space-x-1 transition-colors border border-purple-500/30 flex-shrink-0"
               >
                 {copiedCommand ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                <span>{copiedCommand ? 'Copied!' : 'Copy Command'}</span>
-              </button>
-            </div>
-            <div className="pt-1 flex items-center justify-between text-xs text-gray-400">
-              <span>Saved to: <code className="text-gray-300">E:\Clipper_Sidhiq\downloads\</code></span>
-              <button
-                type="button"
-                onClick={() => {
-                  setYoutubeGuidance(null);
-                  setUploadMode('local');
-                }}
-                className="text-purple-400 hover:text-purple-300 font-semibold flex items-center space-x-1"
-              >
-                <UploadCloud className="w-3.5 h-3.5" />
-                <span>Switch to Local Upload to select it</span>
+                <span>{copiedCommand ? 'Copied helper!' : 'Copy helper command'}</span>
               </button>
             </div>
           </div>
@@ -525,15 +655,51 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
         <div className="rounded-2xl p-8 bg-[#0e1017] border border-white/10 space-y-6 shadow-xl">
           <div className="text-center space-y-2">
             <div className="w-12 h-12 mx-auto rounded-xl bg-purple-500/10 border border-purple-500/20 flex items-center justify-center text-purple-400">
-              <Globe className="w-6 h-6" />
+              {isDesktop ? <Monitor className="w-6 h-6" /> : <Globe className="w-6 h-6" />}
             </div>
-            <h3 className="text-lg font-semibold text-white">Direct Video URL Ingestion</h3>
+            <h3 className="text-lg font-semibold text-white">
+              {isDesktop ? 'Desktop Video Downloader & Clipper' : 'Direct Video URL Ingestion'}
+            </h3>
             <p className="text-xs text-gray-400 max-w-lg mx-auto">
-              Provide a direct link to an MP4, MOV, or WebM file. The video is fetched directly by your browser into local memory with zero cloud servers.
+              {isDesktop
+                ? 'Paste any supported video URL (YouTube, Vimeo, TikTok, direct MP4). The bundled engine downloads the media locally on your machine and runs the clipping pipeline.'
+                : 'Provide a direct link to an MP4, MOV, or WebM file. The video is fetched directly by your browser into local memory with zero cloud servers.'}
             </p>
           </div>
 
-          <form onSubmit={handleFetchUrl} className="space-y-4 max-w-2xl mx-auto">
+          {/* Desktop Destination Folder Picker */}
+          {isDesktop && (
+            <div className="max-w-2xl mx-auto flex items-center justify-between p-3 rounded-xl bg-black/40 border border-white/5 text-xs text-gray-400">
+              <div className="flex items-center space-x-2 truncate mr-2">
+                <Folder className="w-4 h-4 text-purple-400 flex-shrink-0" />
+                <span className="truncate">
+                  Save Folder: <code className="text-gray-200 font-mono">{customDownloadDir || desktopEnv?.downloadsDir || 'ClipperSidhiq_Downloads'}</code>
+                </span>
+              </div>
+              <div className="flex items-center space-x-2 flex-shrink-0">
+                <button
+                  type="button"
+                  onClick={handleSelectFolder}
+                  disabled={isFetchingUrl}
+                  className="px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-gray-300 hover:text-white transition-colors disabled:opacity-50"
+                  title="Choose a different folder for downloaded videos"
+                >
+                  Change
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleOpenFolder()}
+                  className="px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-cyan-300 hover:text-cyan-200 flex items-center space-x-1 transition-colors"
+                  title="Open folder in Windows Explorer"
+                >
+                  <FolderOpen className="w-3.5 h-3.5" />
+                  <span>Open</span>
+                </button>
+              </div>
+            </div>
+          )}
+
+          <form onSubmit={(e) => handleFetchUrl(e, isDesktop)} className="space-y-4 max-w-2xl mx-auto">
             <div className="flex flex-col sm:flex-row gap-3">
               <div className="relative flex-1">
                 <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-gray-500">
@@ -543,65 +709,134 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
                   type="url"
                   value={videoUrl}
                   onChange={(e) => setVideoUrl(e.target.value)}
-                  placeholder="https://example.com/sample_video.mp4"
+                  placeholder={
+                    isDesktop
+                      ? 'https://www.youtube.com/watch?v=... or direct MP4 link'
+                      : 'https://example.com/sample_video.mp4'
+                  }
                   disabled={isFetchingUrl}
                   className="w-full pl-10 pr-4 py-3 bg-[#141620] border border-white/10 rounded-xl text-sm text-white placeholder-gray-500 focus:outline-none focus:border-purple-500 transition-colors disabled:opacity-50"
                 />
               </div>
 
-              <button
-                type="submit"
-                disabled={isFetchingUrl || !videoUrl.trim()}
-                className="px-6 py-3 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-semibold text-sm shadow-lg shadow-purple-600/25 flex items-center justify-center space-x-2 transition-all active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0"
-              >
-                {isFetchingUrl ? (
-                  <>
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                    <span>Fetching...</span>
-                  </>
-                ) : (
-                  <>
-                    <span>Fetch Video</span>
-                    <ArrowRight className="w-4 h-4" />
-                  </>
-                )}
-              </button>
+              {isDesktop ? (
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={(e) => handleFetchUrl(e, true)}
+                    disabled={isFetchingUrl || !videoUrl.trim()}
+                    className="px-5 py-3 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-semibold text-sm shadow-lg shadow-purple-600/25 flex items-center justify-center space-x-2 transition-all active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0"
+                    title="Download video locally and immediately start generating vertical clips"
+                  >
+                    {isFetchingUrl ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        <span>Downloading...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles className="w-4 h-4 text-cyan-300" />
+                        <span>Download and Create Clips</span>
+                      </>
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={(e) => handleFetchUrl(e, false)}
+                    disabled={isFetchingUrl || !videoUrl.trim()}
+                    className="px-3.5 py-3 rounded-xl bg-white/5 hover:bg-white/10 text-gray-300 hover:text-white font-medium text-xs border border-white/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0"
+                    title="Download and validate file locally without immediately auto-clipping"
+                  >
+                    Fetch Only
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="submit"
+                  disabled={isFetchingUrl || !videoUrl.trim()}
+                  className="px-6 py-3 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-semibold text-sm shadow-lg shadow-purple-600/25 flex items-center justify-center space-x-2 transition-all active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0"
+                >
+                  {isFetchingUrl ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span>Fetching...</span>
+                    </>
+                  ) : (
+                    <>
+                      <span>Fetch Video</span>
+                      <ArrowRight className="w-4 h-4" />
+                    </>
+                  )}
+                </button>
+              )}
             </div>
 
             {/* Fetch Progress Bar */}
             {isFetchingUrl && (
-              <div className="space-y-2 p-4 rounded-xl bg-[#141620] border border-white/5">
+              <div className="space-y-3 p-4 rounded-xl bg-[#141620] border border-purple-500/20">
                 <div className="flex items-center justify-between text-xs">
-                  <span className="text-purple-300 font-medium">Downloading video into browser memory...</span>
-                  <span className="font-mono text-gray-400">
+                  <div className="flex items-center space-x-2">
+                    <Loader2 className="w-3.5 h-3.5 text-purple-400 animate-spin" />
+                    <span className="text-purple-300 font-medium">
+                      {isDesktop ? 'Downloading video via bundled yt-dlp...' : 'Downloading video into browser memory...'}
+                    </span>
+                  </div>
+
+                  {isDesktop && (
+                    <button
+                      type="button"
+                      onClick={handleCancelDownload}
+                      className="text-xs text-rose-400 hover:text-rose-300 flex items-center space-x-1 px-2.5 py-1 rounded bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20 transition-colors"
+                      title="Abort the current download process"
+                    >
+                      <XCircle className="w-3.5 h-3.5" />
+                      <span>Cancel Download</span>
+                    </button>
+                  )}
+                </div>
+
+                <div className="w-full bg-white/5 rounded-full h-2.5 overflow-hidden">
+                  <div
+                    className="bg-gradient-to-r from-purple-500 via-indigo-500 to-cyan-400 h-full transition-all duration-150"
+                    style={{ width: `${fetchProgress?.percent || 5}%` }}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between text-[11px] text-gray-400 font-mono">
+                  <span>
                     {fetchProgress && fetchProgress.total > 0
                       ? `${fetchProgress.percent}% (${formatBytes(fetchProgress.loaded)} / ${formatBytes(fetchProgress.total)})`
-                      : fetchProgress
-                      ? `${formatBytes(fetchProgress.loaded)} received`
-                      : 'Connecting...'}
+                      : `${fetchProgress?.percent || 0}%`}
                   </span>
-                </div>
-                <div className="w-full bg-white/5 rounded-full h-2 overflow-hidden">
-                  <div
-                    className="bg-gradient-to-r from-purple-500 to-cyan-400 h-full transition-all duration-150"
-                    style={{ width: `${fetchProgress?.percent || 25}%` }}
-                  />
+                  {downloadSpeed && <span className="text-cyan-300">Speed: {downloadSpeed}</span>}
+                  {downloadEta && <span className="text-purple-300">ETA: {downloadEta}</span>}
                 </div>
               </div>
             )}
 
-            {/* Capability & CORS Notes */}
+            {/* Capability & Sources Notes */}
             <div className="p-4 rounded-xl bg-white/[0.02] border border-white/5 space-y-2 text-xs text-gray-400">
               <div className="flex items-start space-x-2">
                 <HelpCircle className="w-4 h-4 text-purple-400 flex-shrink-0 mt-0.5" />
                 <div className="space-y-1">
-                  <p className="text-gray-300 font-medium">Supported URL Types:</p>
-                  <p className="text-gray-400 leading-relaxed">
-                    Direct media links to <code className="text-purple-300 bg-white/5 px-1 py-0.5 rounded">.mp4</code>, <code className="text-purple-300 bg-white/5 px-1 py-0.5 rounded">.mov</code>, or <code className="text-purple-300 bg-white/5 px-1 py-0.5 rounded">.webm</code> hosted on CORS-permissive servers (e.g. AWS S3, Cloudflare R2, GitHub releases, open web archives, public CDNs).
+                  <p className="text-gray-300 font-medium">
+                    {isDesktop ? 'Desktop Supported Sources:' : 'Supported URL Types:'}
                   </p>
-                  <p className="text-gray-500 pt-1 leading-relaxed">
-                    <strong className="text-gray-400">Streaming Platforms:</strong> YouTube, Vimeo, Instagram, and TikTok block browser fetching via CORS and DRM. To process content from those platforms, download the file to your computer first and use the <strong>Local File Upload</strong> tab.
-                  </p>
+                  {isDesktop ? (
+                    <p className="text-gray-400 leading-relaxed">
+                      YouTube (standard videos & Shorts), Vimeo, TikTok, Twitch, Facebook, Twitter, and direct links to MP4/MOV/WebM. Files are saved locally to your device and validated with FFprobe before vertical clipping.
+                    </p>
+                  ) : (
+                    <>
+                      <p className="text-gray-400 leading-relaxed">
+                        Direct media links to <code className="text-purple-300 bg-white/5 px-1 py-0.5 rounded">.mp4</code>, <code className="text-purple-300 bg-white/5 px-1 py-0.5 rounded">.mov</code>, or <code className="text-purple-300 bg-white/5 px-1 py-0.5 rounded">.webm</code> hosted on CORS-permissive servers.
+                      </p>
+                      <p className="text-gray-500 pt-1 leading-relaxed">
+                        <strong className="text-gray-400">Streaming Platforms:</strong> YouTube, Vimeo, Instagram, and TikTok block browser fetching via CORS and DRM. To process content from those platforms, download the file to your computer first and use the <strong>Local File Upload</strong> tab.
+                      </p>
+                    </>
+                  )}
                 </div>
               </div>
             </div>
@@ -686,6 +921,18 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
                   >
                     <Download className="w-3.5 h-3.5" />
                     <span>Save Copy to Disk</span>
+                  </button>
+                )}
+
+                {downloadedFilePath && (
+                  <button
+                    type="button"
+                    onClick={() => handleOpenFolder(downloadedFilePath)}
+                    className="text-xs text-cyan-300 hover:text-white px-3 py-1.5 rounded-lg bg-cyan-600/20 hover:bg-cyan-600/30 border border-cyan-500/30 flex items-center space-x-1.5 transition-colors"
+                    title="Show original downloaded file in Windows Explorer"
+                  >
+                    <FolderOpen className="w-3.5 h-3.5" />
+                    <span>Show in Explorer</span>
                   </button>
                 )}
 
@@ -817,38 +1064,125 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
         </div>
       )}
 
-      {/* Feature Highlights Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-4">
-        <div className="p-5 rounded-2xl bg-[#0e1017] border border-white/5 space-y-2">
-          <div className="w-8 h-8 rounded-lg bg-cyan-500/10 text-cyan-400 flex items-center justify-center">
-            <Zap className="w-4 h-4" />
+      {/* Premium How It Works Section — Pure Plain English, Zero Jargon */}
+      <section className="pt-10 border-t border-white/5 space-y-8">
+        <div className="text-center space-y-2">
+          <div className="inline-flex items-center space-x-1.5 px-3 py-1 rounded-full bg-purple-500/10 border border-purple-500/20 text-purple-300 text-xs font-semibold uppercase tracking-wider">
+            <Sparkles className="w-3 h-3 text-cyan-400" />
+            <span>How It Works</span>
           </div>
-          <h4 className="font-semibold text-sm text-white">Browser-Native WebCodecs</h4>
-          <p className="text-xs text-gray-400 leading-relaxed">
-            Renders exact 1080x1920 MP4s using client GPU acceleration. Zero server or cloud fees.
+          <h2 className="text-2xl sm:text-3xl font-extrabold text-white tracking-tight">
+            Turn Long Videos into Ready-to-Share Clips
+          </h2>
+          <p className="text-gray-400 text-sm max-w-xl mx-auto">
+            A straightforward, four-step process to transform your footage into engaging vertical content.
           </p>
         </div>
 
-        <div className="p-5 rounded-2xl bg-[#0e1017] border border-white/5 space-y-2">
-          <div className="w-8 h-8 rounded-lg bg-purple-500/10 text-purple-400 flex items-center justify-center">
-            <Sparkles className="w-4 h-4" />
+        {/* 4 Step Cards Grid */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          {/* Step 1 */}
+          <div className="p-5 rounded-2xl bg-[#0e1017] border border-white/5 hover:border-purple-500/30 transition-all duration-200 space-y-3 group shadow-lg">
+            <div className="flex items-center justify-between">
+              <div className="w-10 h-10 rounded-xl bg-purple-500/10 border border-purple-500/20 flex items-center justify-center text-purple-300 group-hover:scale-105 transition-transform">
+                <UploadCloud className="w-5 h-5 text-purple-400" />
+              </div>
+              <span className="text-xs font-bold font-mono px-2 py-0.5 rounded-full bg-white/5 text-purple-300 border border-white/5">
+                01
+              </span>
+            </div>
+            <div>
+              <h3 className="text-sm font-bold text-white group-hover:text-purple-300 transition-colors">
+                Step 1 — Add Your Video
+              </h3>
+              <p className="text-xs text-gray-400 leading-relaxed mt-1.5">
+                Upload a video from your device or paste a supported video link.
+              </p>
+            </div>
           </div>
-          <h4 className="font-semibold text-sm text-white">Adaptive Discovery</h4>
-          <p className="text-xs text-gray-400 leading-relaxed">
-            Speech density & energy peaks dictate clips. Returns 3 strong clips or 20+ when justified.
-          </p>
+
+          {/* Step 2 */}
+          <div className="p-5 rounded-2xl bg-[#0e1017] border border-white/5 hover:border-cyan-500/30 transition-all duration-200 space-y-3 group shadow-lg">
+            <div className="flex items-center justify-between">
+              <div className="w-10 h-10 rounded-xl bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center text-cyan-300 group-hover:scale-105 transition-transform">
+                <Sparkles className="w-5 h-5 text-cyan-400" />
+              </div>
+              <span className="text-xs font-bold font-mono px-2 py-0.5 rounded-full bg-white/5 text-cyan-300 border border-white/5">
+                02
+              </span>
+            </div>
+            <div>
+              <h3 className="text-sm font-bold text-white group-hover:text-cyan-300 transition-colors">
+                Step 2 — Find the Best Moments
+              </h3>
+              <p className="text-xs text-gray-400 leading-relaxed mt-1.5">
+                Clipper analyzes the video and identifies promising moments worth clipping.
+              </p>
+            </div>
+          </div>
+
+          {/* Step 3 */}
+          <div className="p-5 rounded-2xl bg-[#0e1017] border border-white/5 hover:border-indigo-500/30 transition-all duration-200 space-y-3 group shadow-lg">
+            <div className="flex items-center justify-between">
+              <div className="w-10 h-10 rounded-xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center text-indigo-300 group-hover:scale-105 transition-transform">
+                <Smartphone className="w-5 h-5 text-indigo-400" />
+              </div>
+              <span className="text-xs font-bold font-mono px-2 py-0.5 rounded-full bg-white/5 text-indigo-300 border border-white/5">
+                03
+              </span>
+            </div>
+            <div>
+              <h3 className="text-sm font-bold text-white group-hover:text-indigo-300 transition-colors">
+                Step 3 — Create Vertical Clips
+              </h3>
+              <p className="text-xs text-gray-400 leading-relaxed mt-1.5">
+                Your selected moments are transformed into vertical videos ready for Shorts, Reels, and other platforms.
+              </p>
+            </div>
+          </div>
+
+          {/* Step 4 */}
+          <div className="p-5 rounded-2xl bg-[#0e1017] border border-white/5 hover:border-emerald-500/30 transition-all duration-200 space-y-3 group shadow-lg">
+            <div className="flex items-center justify-between">
+              <div className="w-10 h-10 rounded-xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-300 group-hover:scale-105 transition-transform">
+                <Download className="w-5 h-5 text-emerald-400" />
+              </div>
+              <span className="text-xs font-bold font-mono px-2 py-0.5 rounded-full bg-white/5 text-emerald-300 border border-white/5">
+                04
+              </span>
+            </div>
+            <div>
+              <h3 className="text-sm font-bold text-white group-hover:text-emerald-300 transition-colors">
+                Step 4 — Download and Share
+              </h3>
+              <p className="text-xs text-gray-400 leading-relaxed mt-1.5">
+                Preview your clips, download them individually, or export them together.
+              </p>
+            </div>
+          </div>
         </div>
 
-        <div className="p-5 rounded-2xl bg-[#0e1017] border border-white/5 space-y-2">
-          <div className="w-8 h-8 rounded-lg bg-indigo-500/10 text-indigo-400 flex items-center justify-center">
-            <HardDrive className="w-4 h-4" />
+        {/* Clear Privacy Statement based on actual implementation */}
+        <div className="p-5 rounded-2xl bg-[#0b0e14] border border-emerald-500/20 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 shadow-lg">
+          <div className="flex items-start space-x-3.5">
+            <div className="w-10 h-10 rounded-xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400 flex-shrink-0 mt-0.5 sm:mt-0">
+              <ShieldCheck className="w-5 h-5" />
+            </div>
+            <div className="space-y-1">
+              <h4 className="text-sm font-semibold text-white">100% Private On-Device Processing</h4>
+              <p className="text-xs text-gray-400 leading-relaxed max-w-2xl">
+                Your video files and clips remain entirely on your device. All clip discovery and vertical video creation happen locally in your browser or desktop app with zero cloud servers.
+              </p>
+            </div>
           </div>
-          <h4 className="font-semibold text-sm text-white">100% Client Privacy</h4>
-          <p className="text-xs text-gray-400 leading-relaxed">
-            Your footage never leaves your device. Hostable on Vercel and accessible anywhere.
-          </p>
+          <div className="flex-shrink-0 self-end sm:self-center">
+            <span className="inline-flex items-center space-x-1.5 px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-300 text-xs font-medium border border-emerald-500/20">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+              <span>Zero Cloud Upload</span>
+            </span>
+          </div>
         </div>
-      </div>
+      </section>
     </div>
   );
 };

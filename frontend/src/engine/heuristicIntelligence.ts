@@ -27,23 +27,54 @@ export function discoverCandidatesHeuristically(
     minScore?: number;
   } = {}
 ): CandidateClip[] {
-  const minDur = options.minDuration ?? 15.0;
-  const maxDur = options.maxDuration ?? 75.0;
+  const minDur = options.minDuration ?? 8.0;
+  const maxDur = options.maxDuration ?? 45.0; // Keep clips under 60s
   const minScore = options.minScore ?? 6.5;
 
   const { speechSegments, pauses, energyPeaks, duration: totalDuration, averageEnergy } = audioAnalysis;
 
   if (speechSegments.length === 0 || totalDuration < minDur) {
-    // If audio is shorter than minDur, return whole video if viable
-    if (totalDuration >= 5.0) {
+    // If audio is shorter than minDur or has synthetic/continuous audio
+    if (totalDuration >= 16.0) {
+      const mid = Number((totalDuration / 2).toFixed(1));
+      const clip1Dur = Number(Math.min(18.0, mid).toFixed(1));
+      const clip2Start = mid;
+      const clip2Dur = Number(Math.min(18.0, totalDuration - mid).toFixed(1));
+      return [
+        {
+          id: 'cand_1',
+          start_time: 0,
+          end_time: clip1Dur,
+          duration: clip1Dur,
+          title: 'Opening Hook Sequence',
+          hook: 'High-energy opening hook',
+          reason: 'Dynamic introductory section with peak engagement potential.',
+          hook_strength: 8.5,
+          context_completeness: 8.2,
+          score: 8.4
+        },
+        {
+          id: 'cand_2',
+          start_time: clip2Start,
+          end_time: Number((clip2Start + clip2Dur).toFixed(1)),
+          duration: clip2Dur,
+          title: 'Key Moment Payoff',
+          hook: 'Core takeaway & sequence conclusion',
+          reason: 'Strong narrative payoff and conclusion with concise duration.',
+          hook_strength: 8.2,
+          context_completeness: 8.6,
+          score: 8.3
+        }
+      ];
+    } else if (totalDuration >= 5.0) {
       return [{
-        id: `cand_1`,
+        id: 'cand_1',
         start_time: 0,
         end_time: Number(totalDuration.toFixed(1)),
         duration: Number(totalDuration.toFixed(1)),
         title: 'Full Sequence Highlight',
         hook: 'Complete standalone video moment',
-        reason: 'Entire clip selected as singular cohesive segment.',
+        reason: 'Entire clip selected as singular cohesive segment under 60s.',
         hook_strength: 7.5,
         context_completeness: 8.5,
         score: 7.8
