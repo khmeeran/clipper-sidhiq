@@ -12,15 +12,19 @@ export interface StorageInfo {
 
 const DB_NAME = 'clipper_sidhiq_db';
 const STORE_NAME = 'jobs';
-const DB_VERSION = 1;
+const CACHE_STORE_NAME = 'downloaded_videos';
+const DB_VERSION = 2;
 
 function openDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = () => {
+    req.onupgradeneeded = (e: IDBVersionChangeEvent) => {
       const db = req.result;
       if (!db.objectStoreNames.contains(STORE_NAME)) {
         db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+      }
+      if (!db.objectStoreNames.contains(CACHE_STORE_NAME)) {
+        db.createObjectStore(CACHE_STORE_NAME, { keyPath: 'url' });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -116,4 +120,44 @@ export async function performRetentionCleanup(retentionHours: number = 6.0): Pro
     }
   } catch (_) {}
   return cleanedCount;
+}
+
+export interface CachedVideoEntry {
+  url: string;
+  filename: string;
+  blob: Blob;
+  size: number;
+  mimeType: string;
+  cachedAt: number;
+}
+
+export async function getCachedVideo(url: string): Promise<CachedVideoEntry | null> {
+  try {
+    const db = await openDB();
+    if (!db.objectStoreNames.contains(CACHE_STORE_NAME)) return null;
+    const tx = db.transaction(CACHE_STORE_NAME, 'readonly');
+    const store = tx.objectStore(CACHE_STORE_NAME);
+    const req = store.get(url);
+    return new Promise((resolve) => {
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => resolve(null);
+    });
+  } catch (_) {
+    return null;
+  }
+}
+
+export async function saveCachedVideo(entry: CachedVideoEntry): Promise<void> {
+  try {
+    const db = await openDB();
+    if (!db.objectStoreNames.contains(CACHE_STORE_NAME)) return;
+    const tx = db.transaction(CACHE_STORE_NAME, 'readwrite');
+    tx.objectStore(CACHE_STORE_NAME).put(entry);
+    return new Promise((resolve) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+  } catch (e) {
+    console.warn('Failed to cache downloaded video in IndexedDB:', e);
+  }
 }

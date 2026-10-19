@@ -15,15 +15,89 @@ import {
   Globe,
   ArrowRight,
   Loader2,
-  HelpCircle
+  HelpCircle,
+  CheckCircle2,
+  Download,
+  Copy,
+  Check,
+  Terminal
 } from 'lucide-react';
 import { BrowserSystemStatus, ClientSettings } from '../types';
+import { getCachedVideo, saveCachedVideo } from '../engine/storageManager';
 
 interface UploadWorkspaceProps {
   onStartProcessing: (file: File, options: Record<string, any>) => Promise<void>;
   isProcessing: boolean;
   systemStatus: BrowserSystemStatus | null;
   settings: ClientSettings;
+}
+
+/**
+ * Validates container magic bytes and decodes metadata using HTMLVideoElement.
+ * Throws an explicit error if the file is incomplete, corrupted, or not a playable video.
+ */
+async function validateVideoContainer(blob: Blob): Promise<{ duration: number; width: number; height: number }> {
+  if (blob.size < 1024) {
+    throw new Error('Downloaded file is smaller than 1 KB and is not a valid video.');
+  }
+
+  // 1. Check header magic bytes for MP4 / MOV / WebM / MKV
+  const headerSlice = blob.slice(0, 32);
+  const headerBuffer = await headerSlice.arrayBuffer();
+  const headerBytes = new Uint8Array(headerBuffer);
+
+  const isWebM = headerBytes[0] === 0x1a && headerBytes[1] === 0x45 && headerBytes[2] === 0xdf && headerBytes[3] === 0xa3;
+  const headerStr = Array.from(headerBytes).map(b => String.fromCharCode(b)).join('');
+  const isMp4OrMov = headerStr.includes('ftyp') || headerStr.includes('moov') || headerStr.includes('mdat') || headerStr.includes('wide');
+  const isRiff = headerStr.startsWith('RIFF');
+
+  if (!isWebM && !isMp4OrMov && !isRiff) {
+    throw new Error('Validation failed: Downloaded data does not match a recognized MP4, MOV, WebM, or MKV container signature.');
+  }
+
+  // 2. Decode metadata client-side via temporary video element
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob);
+    const video = document.createElement('video');
+    video.preload = 'metadata';
+
+    const cleanUp = () => {
+      URL.revokeObjectURL(url);
+      video.removeEventListener('loadedmetadata', onLoaded);
+      video.removeEventListener('error', onError);
+    };
+
+    const timer = setTimeout(() => {
+      cleanUp();
+      reject(new Error('Validation failed: Video metadata probe timed out. The file may be truncated or corrupted.'));
+    }, 12000);
+
+    const onLoaded = () => {
+      clearTimeout(timer);
+      const duration = video.duration;
+      const width = video.videoWidth;
+      const height = video.videoHeight;
+      cleanUp();
+
+      if (!duration || isNaN(duration) || duration <= 0) {
+        reject(new Error('Validation failed: Video container has 0 duration.'));
+      } else if (!width || !height) {
+        reject(new Error('Validation failed: Video dimensions could not be parsed.'));
+      } else {
+        resolve({ duration, width, height });
+      }
+    };
+
+    const onError = () => {
+      clearTimeout(timer);
+      cleanUp();
+      reject(new Error('Validation failed: Browser media decoder could not parse video frames. Unsupported codec or damaged file.'));
+    };
+
+    video.addEventListener('loadedmetadata', onLoaded);
+    video.addEventListener('error', onError);
+    video.src = url;
+  });
 }
 
 export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
@@ -42,6 +116,17 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
   const [videoUrl, setVideoUrl] = useState('');
   const [isFetchingUrl, setIsFetchingUrl] = useState(false);
   const [fetchProgress, setFetchProgress] = useState<{ percent: number; loaded: number; total: number } | null>(null);
+  const [downloadSpeed, setDownloadSpeed] = useState<string>('');
+
+  // Downloaded File Local Persistence & State
+  const [downloadedBlob, setDownloadedBlob] = useState<Blob | null>(null);
+  const [downloadedFilename, setDownloadedFilename] = useState<string>('');
+  const [isDownloadedFromUrl, setIsDownloadedFromUrl] = useState(false);
+  const [isCachedDownload, setIsCachedDownload] = useState(false);
+
+  // YouTube Guidance & Architecture Proposal State
+  const [youtubeGuidance, setYoutubeGuidance] = useState<{ url: string; videoId?: string } | null>(null);
+  const [copiedCommand, setCopiedCommand] = useState(false);
 
   // Custom job preferences
   const [reframingMode, setReframingMode] = useState<'blur_background' | 'center_crop'>(settings.reframing_mode || 'blur_background');
@@ -54,6 +139,7 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
   const handleFetchUrl = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     setErrorMessage(null);
+    setYoutubeGuidance(null);
     const trimmed = videoUrl.trim();
 
     if (!trimmed) {
@@ -68,21 +154,52 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
 
     const lower = trimmed.toLowerCase();
     if (lower.includes('youtube.com') || lower.includes('youtu.be')) {
-      setErrorMessage(
-        'YouTube watch URLs are streaming webpages, not direct video files. Modern web browsers cannot fetch raw YouTube streams directly due to platform security and CORS. Please download the video file to your computer first and use the Local File Upload tab.'
-      );
+      let videoId = '';
+      try {
+        if (lower.includes('youtu.be/')) {
+          videoId = trimmed.split('youtu.be/')[1].split(/[?#]/)[0];
+        } else if (lower.includes('watch?v=') || lower.includes('watch/')) {
+          const match = trimmed.match(/[?&]v=([^&#]+)/);
+          if (match) videoId = match[1];
+        }
+      } catch (_) {}
+      setYoutubeGuidance({ url: trimmed, videoId });
       return;
     }
 
     if (['vimeo.com', 'instagram.com', 'tiktok.com', 'twitter.com', 'x.com', 'facebook.com'].some(d => lower.includes(d))) {
       setErrorMessage(
-        'Social and video streaming platforms restrict direct browser media access (CORS & DRM). Please download the video file locally and use the Local File Upload tab.'
+        'Social and streaming platform links restrict direct browser media access (CORS & DRM). Please download the video file locally and use the Local File Upload tab.'
       );
       return;
     }
 
+    // 1. Check local IndexedDB cache to avoid duplicate downloads
+    try {
+      const cached = await getCachedVideo(trimmed);
+      if (cached && cached.blob && cached.blob.size > 1024) {
+        setIsFetchingUrl(true);
+        const metadata = await validateVideoContainer(cached.blob);
+        const file = new File([cached.blob], cached.filename, { type: cached.mimeType || 'video/mp4' });
+        setDownloadedBlob(cached.blob);
+        setDownloadedFilename(cached.filename);
+        setIsDownloadedFromUrl(true);
+        setIsCachedDownload(true);
+        setSelectedFile(file);
+        setVideoPreview(metadata);
+        setIsFetchingUrl(false);
+        return;
+      }
+    } catch (cErr) {
+      console.warn('Cache check bypassed:', cErr);
+    }
+
     setIsFetchingUrl(true);
     setFetchProgress(null);
+    setDownloadSpeed('');
+    setIsCachedDownload(false);
+
+    const downloadStartTime = performance.now();
 
     try {
       const response = await fetch(trimmed, {
@@ -116,8 +233,11 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
           if (value) {
             chunks.push(value);
             loadedBytes += value.length;
+            const elapsedSec = (performance.now() - downloadStartTime) / 1000;
+            const speed = elapsedSec > 0 ? (loadedBytes / (1024 * 1024)) / elapsedSec : 0;
             const pct = totalBytes > 0 ? Math.min(100, Math.round((loadedBytes / totalBytes) * 100)) : 0;
             setFetchProgress({ percent: pct, loaded: loadedBytes, total: totalBytes });
+            setDownloadSpeed(`${speed.toFixed(1)} MB/s`);
           }
         }
       } else {
@@ -126,12 +246,13 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
         loadedBytes = buffer.byteLength;
       }
 
+      // 1. Minimum Size Check
       if (loadedBytes < 1024) {
-        throw new Error('The downloaded file is less than 1 KB and is not a valid video.');
+        throw new Error('Downloaded file is smaller than 1 KB and is not a valid video.');
       }
 
       // Extract filename from URL
-      let filename = 'remote_video.mp4';
+      let filename = 'downloaded_video.mp4';
       try {
         const urlObj = new URL(trimmed);
         const namePart = urlObj.pathname.split('/').pop();
@@ -141,18 +262,42 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
       } catch (_) {}
 
       const inferredMime = contentType.startsWith('video/') ? contentType : 'video/mp4';
-      const file = new File(chunks as any, filename, { type: inferredMime });
+      const blob = new Blob(chunks as any, { type: inferredMime });
 
-      handleFileSelect(file);
+      // 2. Validate Container Integrity & Browser Decoding Before Handing to Pipeline
+      const metadata = await validateVideoContainer(blob);
+
+      // 3. Save Persistent Copy in IndexedDB Cache
+      await saveCachedVideo({
+        url: trimmed,
+        filename,
+        blob,
+        size: loadedBytes,
+        mimeType: inferredMime,
+        cachedAt: Date.now()
+      });
+
+      // 4. Construct local File object and populate workspace
+      const file = new File([blob], filename, { type: inferredMime });
+      setDownloadedBlob(blob);
+      setDownloadedFilename(filename);
+      setIsDownloadedFromUrl(true);
+      setSelectedFile(file);
+      setVideoPreview(metadata);
       setVideoUrl('');
     } catch (err: any) {
-      console.error('URL video fetch failed:', err);
+      console.error('URL video download failed:', err);
+      // Incomplete or failed downloads must NEVER enter the processing pipeline
+      setSelectedFile(null);
+      setDownloadedBlob(null);
+      setIsDownloadedFromUrl(false);
+
       if (err.name === 'TypeError' && err.message?.toLowerCase().includes('failed to fetch')) {
         setErrorMessage(
-          'Browser CORS Blocked: The remote server hosting this video does not allow cross-origin requests from other web pages. Modern browsers block this for security. Fallback: Download the video file to your computer and use the Local File Upload tab.'
+          'Browser CORS Blocked: The remote server hosting this video does not send cross-origin headers (Access-Control-Allow-Origin). Modern web browsers block client-side reading for security. Fallback: Download the file to your computer and use the Local File Upload tab.'
         );
       } else {
-        setErrorMessage(err.message || 'Failed to retrieve video from the specified URL.');
+        setErrorMessage(err.message || 'Failed to download or validate video from the specified URL.');
       }
     } finally {
       setIsFetchingUrl(false);
@@ -160,8 +305,23 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
     }
   };
 
+  const handleSaveDiskCopy = () => {
+    if (!downloadedBlob) return;
+    const url = URL.createObjectURL(downloadedBlob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = downloadedFilename || 'downloaded_video.mp4';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
   const handleFileSelect = (file: File) => {
     setErrorMessage(null);
+    setYoutubeGuidance(null);
+    setIsDownloadedFromUrl(false);
+    setDownloadedBlob(null);
     const validExtensions = ['.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v'];
     const ext = '.' + file.name.split('.').pop()?.toLowerCase();
     
@@ -258,6 +418,7 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
               onClick={() => {
                 setUploadMode('local');
                 setErrorMessage(null);
+                setYoutubeGuidance(null);
               }}
               className={`flex items-center space-x-2 px-5 py-2 rounded-lg text-xs font-semibold transition-all ${
                 uploadMode === 'local'
@@ -288,8 +449,79 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
         </div>
       )}
 
+      {/* YouTube Stream Guidance & Architecture Notice */}
+      {youtubeGuidance && !selectedFile && (
+        <div data-testid="youtube-guidance-panel" className="rounded-2xl p-6 bg-[#13151f] border border-purple-500/30 space-y-4 shadow-xl">
+          <div className="flex items-start justify-between">
+            <div className="flex items-center space-x-3">
+              <div className="w-10 h-10 rounded-xl bg-purple-500/20 border border-purple-500/30 flex items-center justify-center text-purple-300">
+                <Globe className="w-5 h-5" />
+              </div>
+              <div>
+                <h4 className="font-semibold text-white text-sm">YouTube Stream Ingestion Notice</h4>
+                <p className="text-xs text-gray-400">Target URL: <span className="text-purple-300 font-mono truncate max-w-sm inline-block align-bottom">{youtubeGuidance.url}</span></p>
+              </div>
+            </div>
+            <button
+              onClick={() => setYoutubeGuidance(null)}
+              className="text-xs text-gray-400 hover:text-white px-2 py-1 rounded bg-white/5 hover:bg-white/10"
+            >
+              Dismiss
+            </button>
+          </div>
+
+          <div className="p-4 rounded-xl bg-black/40 border border-white/5 space-y-2 text-xs text-gray-300 leading-relaxed">
+            <p className="font-semibold text-purple-300">Why YouTube URLs cannot be directly downloaded by a browser:</p>
+            <ul className="list-disc list-inside space-y-1 text-gray-400 pl-1">
+              <li><strong className="text-gray-300">No static video file:</strong> YouTube watch pages deliver HTML and separate DASH video & audio streams from dynamic subdomains of <code className="text-purple-300">googlevideo.com</code>.</li>
+              <li><strong className="text-gray-300">Browser CORS enforcement:</strong> Google strictly enforces Cross-Origin Resource Sharing on <code className="text-purple-300">googlevideo.com</code>, forbidding client web browsers from fetching media segments.</li>
+              <li><strong className="text-gray-300">Rotating cipher signatures:</strong> YouTube requires dynamic JavaScript de-obfuscation algorithms that cannot execute inside an isolated browser sandbox.</li>
+            </ul>
+          </div>
+
+          <div className="p-4 rounded-xl bg-purple-950/20 border border-purple-500/20 space-y-3">
+            <div className="flex items-center space-x-2 text-xs text-purple-200 font-medium">
+              <Terminal className="w-4 h-4 text-purple-400" />
+              <span>Smallest Compliant Architecture Solution — Local Fetcher Companion:</span>
+            </div>
+            <p className="text-xs text-gray-400">
+              Run this one-click command in your project terminal to download the genuine 1080p MP4 file to your disk:
+            </p>
+            <div className="flex items-center space-x-2 bg-black/60 p-2.5 rounded-lg border border-white/10 font-mono text-xs text-purple-300 overflow-x-auto">
+              <span className="flex-1 select-all">python tools/fetch_youtube.py "{youtubeGuidance.url}"</span>
+              <button
+                type="button"
+                onClick={() => {
+                  navigator.clipboard.writeText(`python tools/fetch_youtube.py "${youtubeGuidance.url}"`);
+                  setCopiedCommand(true);
+                  setTimeout(() => setCopiedCommand(false), 2500);
+                }}
+                className="px-3 py-1 rounded bg-purple-600/30 hover:bg-purple-600/50 text-purple-200 font-sans text-xs flex items-center space-x-1.5 transition-colors border border-purple-500/30 flex-shrink-0"
+              >
+                {copiedCommand ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                <span>{copiedCommand ? 'Copied!' : 'Copy Command'}</span>
+              </button>
+            </div>
+            <div className="pt-1 flex items-center justify-between text-xs text-gray-400">
+              <span>Saved to: <code className="text-gray-300">E:\Clipper_Sidhiq\downloads\</code></span>
+              <button
+                type="button"
+                onClick={() => {
+                  setYoutubeGuidance(null);
+                  setUploadMode('local');
+                }}
+                className="text-purple-400 hover:text-purple-300 font-semibold flex items-center space-x-1"
+              >
+                <UploadCloud className="w-3.5 h-3.5" />
+                <span>Switch to Local Upload to select it</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* URL Video Ingestion Card */}
-      {uploadMode === 'url' && !selectedFile && (
+      {uploadMode === 'url' && !selectedFile && !youtubeGuidance && (
         <div className="rounded-2xl p-8 bg-[#0e1017] border border-white/10 space-y-6 shadow-xl">
           <div className="text-center space-y-2">
             <div className="w-12 h-12 mx-auto rounded-xl bg-purple-500/10 border border-purple-500/20 flex items-center justify-center text-purple-400">
@@ -444,16 +676,44 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
                 </div>
               </div>
 
-              <button
-                onClick={() => {
-                  setSelectedFile(null);
-                  setVideoPreview(null);
-                }}
-                className="text-xs text-gray-400 hover:text-white px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 transition-colors"
-              >
-                Change File
-              </button>
+              <div className="flex items-center space-x-2">
+                {isDownloadedFromUrl && downloadedBlob && (
+                  <button
+                    type="button"
+                    onClick={handleSaveDiskCopy}
+                    className="text-xs text-purple-300 hover:text-white px-3 py-1.5 rounded-lg bg-purple-600/20 hover:bg-purple-600/30 border border-purple-500/30 flex items-center space-x-1.5 transition-colors"
+                    title="Save this downloaded video permanently to your disk"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>Save Copy to Disk</span>
+                  </button>
+                )}
+
+                <button
+                  onClick={() => {
+                    setSelectedFile(null);
+                    setVideoPreview(null);
+                    setDownloadedBlob(null);
+                    setIsDownloadedFromUrl(false);
+                  }}
+                  className="text-xs text-gray-400 hover:text-white px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 transition-colors"
+                >
+                  Change File
+                </button>
+              </div>
             </div>
+
+            {/* Downloaded from URL Validation Banner */}
+            {isDownloadedFromUrl && (
+              <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 flex items-center space-x-2.5 text-xs text-emerald-300">
+                <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0" />
+                <span>
+                  {isCachedDownload
+                    ? 'Reused from validated local device storage (zero duplicate download).'
+                    : 'Download completed & validated. Video is stored locally on your device and ready for clipping.'}
+                </span>
+              </div>
+            )}
 
             {/* Quick Production Options */}
             <div className="pt-4 border-t border-white/5 grid grid-cols-1 sm:grid-cols-2 gap-4">
