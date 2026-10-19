@@ -175,6 +175,7 @@ export class ClientClipperPipeline {
           {
             reframingMode: options.reframingMode || 'blur_background',
             subtitleStyle: options.subtitleStyle || 'violet_glow',
+            audioBuffer: audioResult.audioBuffer,
             onProgress: (subPct, subMsg) => {
               if (this.isCancelled) throw new Error('Job cancelled by user.');
               const currentStepPct = basePct + Math.round((subPct / 100) * (25 / selectedClips.length));

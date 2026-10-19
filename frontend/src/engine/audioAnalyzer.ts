@@ -11,6 +11,7 @@ export interface AudioAnalysisResult {
   pauses: { start: number; end: number; duration: number }[];
   energyPeaks: { start: number; end: number; peakScore: number }[];
   averageEnergy: number;
+  audioBuffer?: AudioBuffer;
 }
 
 export async function extractAndAnalyzeAudio(
@@ -24,9 +25,9 @@ export async function extractAndAnalyzeAudio(
 
   onProgress?.(25, 'Decoding audio samples via Web Audio API...');
 
-  // 2. Decode using AudioContext
+  // 2. Decode using AudioContext at standard 44.1kHz (compatible with browser AudioEncoder)
   const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({
-    sampleRate: 22050 // Downsample to 22.05kHz for high-speed analysis
+    sampleRate: 44100
   });
 
   let audioBuffer: AudioBuffer;
@@ -169,7 +170,8 @@ export async function extractAndAnalyzeAudio(
     speechSegments,
     pauses,
     energyPeaks,
-    averageEnergy: averageRms
+    averageEnergy: averageRms,
+    audioBuffer
   };
 }
 

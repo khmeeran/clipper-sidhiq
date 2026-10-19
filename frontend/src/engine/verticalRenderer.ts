@@ -23,6 +23,7 @@ export interface RenderOptions {
   reframingMode?: 'blur_background' | 'center_crop';
   subtitleStyle?: 'violet_glow' | 'radiant_gold' | 'clean_white';
   marginV?: number;
+  audioBuffer?: AudioBuffer;
   onProgress?: (pct: number, message: string) => void;
 }
 
@@ -35,6 +36,7 @@ export async function renderVerticalClipInBrowser(
   const reframingMode = options.reframingMode || 'blur_background';
   const subtitleStyle = options.subtitleStyle || 'violet_glow';
   const marginV = options.marginV || 380;
+  const audioBuffer = options.audioBuffer;
   const onProgress = options.onProgress;
 
   const width = 1080;
@@ -78,6 +80,7 @@ export async function renderVerticalClipInBrowser(
         reframingMode,
         subtitleStyle,
         marginV,
+        audioBuffer,
         thumbCanvas,
         thumbCtx,
         (thumb) => { thumbDataUrl = thumb; },
@@ -145,6 +148,7 @@ async function renderWithWebCodecs(
   reframingMode: string,
   subtitleStyle: string,
   marginV: number,
+  audioBuffer: AudioBuffer | undefined,
   thumbCanvas: HTMLCanvasElement,
   thumbCtx: CanvasRenderingContext2D,
   setThumb: (url: string) => void,
@@ -156,15 +160,65 @@ async function renderWithWebCodecs(
   const duration = clip.end_time - clip.start_time;
   const totalFrames = Math.round(duration * fps);
 
-  const muxer = new Muxer({
+  // Check if browser AudioEncoder is available and supports AAC at target sample rate
+  let canEncodeAudio = false;
+  let targetAudioBuffer = audioBuffer;
+  let audioSampleRate = 44100;
+  let audioChannels = 2;
+
+  if (typeof window !== 'undefined' && 'AudioEncoder' in window && 'AudioData' in window && !!audioBuffer) {
+    try {
+      let rate = audioBuffer.sampleRate;
+      if (rate !== 44100 && rate !== 48000) {
+        // Resample to 44.1kHz standard AAC rate using Web Audio OfflineAudioContext
+        const offlineCtx = new OfflineAudioContext(
+          Math.min(2, audioBuffer.numberOfChannels),
+          Math.max(1, Math.ceil(audioBuffer.duration * 44100)),
+          44100
+        );
+        const src = offlineCtx.createBufferSource();
+        src.buffer = audioBuffer;
+        src.connect(offlineCtx.destination);
+        src.start(0);
+        targetAudioBuffer = await offlineCtx.startRendering();
+        rate = 44100;
+      }
+      audioSampleRate = rate;
+      audioChannels = Math.min(2, targetAudioBuffer?.numberOfChannels || 2);
+
+      const support = await AudioEncoder.isConfigSupported({
+        codec: 'mp4a.40.2',
+        sampleRate: audioSampleRate,
+        numberOfChannels: audioChannels,
+        bitrate: 128_000
+      });
+      canEncodeAudio = !!support.supported;
+    } catch (err) {
+      console.warn('AudioEncoder config check failed, omitting audio track:', err);
+      canEncodeAudio = false;
+    }
+  }
+
+  const muxerOptions: any = {
     target: new ArrayBufferTarget(),
     video: {
       codec: 'avc',
       width,
       height
     },
-    fastStart: 'in-memory'
-  });
+    fastStart: 'in-memory',
+    firstTimestampBehavior: 'offset'
+  };
+
+  if (canEncodeAudio && targetAudioBuffer) {
+    muxerOptions.audio = {
+      codec: 'aac',
+      sampleRate: audioSampleRate,
+      numberOfChannels: audioChannels
+    };
+  }
+
+  const muxer = new Muxer(muxerOptions);
 
   const encoder = new VideoEncoder({
     output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
@@ -180,44 +234,146 @@ async function renderWithWebCodecs(
     framerate: fps
   });
 
-  // Render frames sequentially by seeking
-  video.pause();
+  // Start smooth continuous playback from clip start
+  await seekVideo(video, clip.start_time);
+  await video.play();
+
   let capturedThumb = false;
-  const midFrame = Math.floor(totalFrames / 2);
+  let frameIdx = 0;
+  const startTimeMs = performance.now();
 
-  for (let frameIdx = 0; frameIdx < totalFrames; frameIdx++) {
-    const currentTime = clip.start_time + (frameIdx / fps);
-    await seekVideo(video, currentTime);
+  await new Promise<void>((resolve) => {
+    let resolved = false;
+    const finish = () => {
+      if (resolved) return;
+      resolved = true;
+      video.removeEventListener('ended', finish);
+      video.removeEventListener('pause', finish);
+      video.pause();
+      resolve();
+    };
 
-    // Draw composition onto 1080x1920 canvas
-    drawVerticalFrame(ctx, video, width, height, reframingMode, currentTime, clip.start_time, transcript, subtitleStyle, marginV);
+    video.addEventListener('ended', finish);
+    video.addEventListener('pause', finish);
 
-    // Capture thumbnail at midpoint
-    if (frameIdx === midFrame || (!capturedThumb && frameIdx > 5)) {
-      thumbCtx.drawImage(canvas, 0, 0, thumbCanvas.width, thumbCanvas.height);
-      setThumb(thumbCanvas.toDataURL('image/jpeg', 0.85));
-      capturedThumb = true;
+    // Safety fallback timeout
+    const safetyTimer = setTimeout(finish, (duration + 3.0) * 1000);
+
+    const handleFrame = async () => {
+      if (resolved) return;
+      const elapsedSec = (performance.now() - startTimeMs) / 1000;
+      const currentTime = video.currentTime;
+
+      // Draw composition onto 1080x1920 canvas
+      drawVerticalFrame(
+        ctx,
+        video,
+        width,
+        height,
+        reframingMode,
+        currentTime,
+        clip.start_time,
+        transcript,
+        subtitleStyle,
+        marginV
+      );
+
+      // Capture thumbnail
+      if (!capturedThumb && elapsedSec > 0.5) {
+        thumbCtx.drawImage(canvas, 0, 0, thumbCanvas.width, thumbCanvas.height);
+        setThumb(thumbCanvas.toDataURL('image/jpeg', 0.85));
+        capturedThumb = true;
+      }
+
+      const timestampMicros = Math.round((frameIdx / fps) * 1_000_000);
+      const keyFrame = frameIdx % 60 === 0;
+
+      const videoFrame = new VideoFrame(canvas, {
+        timestamp: timestampMicros,
+        duration: Math.round(1_000_000 / fps)
+      });
+
+      encoder.encode(videoFrame, { keyFrame });
+      videoFrame.close();
+      frameIdx++;
+
+      if (frameIdx % 15 === 0) {
+        const pct = 15 + Math.min(75, Math.round((elapsedSec / duration) * 75));
+        onProgress?.(pct, `Encoding vertical frame ${frameIdx} (${elapsedSec.toFixed(1)}s / ${duration.toFixed(1)}s)...`);
+      }
+
+      if (currentTime < clip.end_time - 0.08 && !video.paused && !video.ended && elapsedSec < duration) {
+        if ('requestVideoFrameCallback' in video) {
+          (video as any).requestVideoFrameCallback(handleFrame);
+        } else {
+          requestAnimationFrame(handleFrame);
+        }
+      } else {
+        clearTimeout(safetyTimer);
+        finish();
+      }
+    };
+
+    if ('requestVideoFrameCallback' in video) {
+      (video as any).requestVideoFrameCallback(handleFrame);
+    } else {
+      requestAnimationFrame(handleFrame);
     }
+  });
 
-    const timestampMicros = Math.round((frameIdx / fps) * 1_000_000);
-    const keyFrame = frameIdx % 60 === 0;
+  await encoder.flush();
 
-    const videoFrame = new VideoFrame(canvas, {
-      timestamp: timestampMicros,
-      duration: Math.round(1_000_000 / fps)
-    });
+  // Encode audio track if audioBuffer is available and AudioEncoder is supported
+  if (canEncodeAudio && targetAudioBuffer) {
+    try {
+      const audioEncoder = new AudioEncoder({
+        output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+        error: (e) => console.warn('AudioEncoder warning:', e)
+      });
 
-    encoder.encode(videoFrame, { keyFrame });
-    videoFrame.close();
+      await audioEncoder.configure({
+        codec: 'mp4a.40.2',
+        sampleRate: audioSampleRate,
+        numberOfChannels: audioChannels,
+        bitrate: 192_000
+      });
 
-    if (frameIdx % 10 === 0) {
-      const pct = 15 + Math.round((frameIdx / totalFrames) * 75);
-      onProgress?.(pct, `Encoding vertical frame ${frameIdx}/${totalFrames} (${Math.round((frameIdx/fps))}s)...`);
-      await new Promise(r => setTimeout(r, 0)); // Yield to UI thread
+      const startSample = Math.floor(clip.start_time * audioSampleRate);
+      const endSample = Math.min(targetAudioBuffer.length, Math.floor(clip.end_time * audioSampleRate));
+      const totalAudioSamples = Math.max(0, endSample - startSample);
+      const blockSize = 1024;
+
+      for (let offset = 0; offset < totalAudioSamples; offset += blockSize) {
+        const currentBlock = Math.min(blockSize, totalAudioSamples - offset);
+        const planarData = new Float32Array(currentBlock * audioChannels);
+
+        for (let ch = 0; ch < audioChannels; ch++) {
+          const channelSamples = targetAudioBuffer.getChannelData(ch);
+          planarData.set(
+            channelSamples.subarray(startSample + offset, startSample + offset + currentBlock),
+            ch * currentBlock
+          );
+        }
+
+        const audioData = new AudioData({
+          format: 'f32-planar',
+          sampleRate: audioSampleRate,
+          numberOfFrames: currentBlock,
+          numberOfChannels: audioChannels,
+          timestamp: Math.round((offset / audioSampleRate) * 1_000_000),
+          data: planarData
+        });
+
+        audioEncoder.encode(audioData);
+        audioData.close();
+      }
+
+      await audioEncoder.flush();
+    } catch (aErr) {
+      console.warn('Audio encoding skipped/fallback:', aErr);
     }
   }
 
-  await encoder.flush();
   muxer.finalize();
 
   const buffer = (muxer.target as ArrayBufferTarget).buffer;
