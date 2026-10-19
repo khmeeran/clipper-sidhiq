@@ -1,111 +1,98 @@
-# Clipper Sidhiq — Ultra-Premium Local AI Video Clipping Studio
+# Clipper Sidhiq — Vercel-Accessible, Serverless Video Clipping Studio
 
 > **Turn Long Videos Into Moments That Matter.**  
-> A 100% local-first Windows application for intelligent speech transcription, viral moment discovery, 9:16 vertical reframing, and animated subtitle burning. Built for Sidhiq.
+> A 100% serverless, in-browser AI video clipping web application built for Sidhiq. Runs on the user's device from any public Vercel URL — zero Ollama, zero Python servers, zero cloud APIs.
 
 ---
 
-## 1. Key Principles & Capabilities
-
-1. **100% Host-Isolated (Local-First):** All video processing, Whisper transcription, Ollama LLM inference, and temporary media storage stay entirely on the Windows host. Zero cloud servers, paid APIs, or subscriptions required.
-2. **Adaptive Discovery (No Arbitrary Quotas):** Content dictates the number of clips. Three strong moments are better than ten weak ones; twenty or more are supported when justified.
-3. **Exact Vertical Specification:** Every generated clip is strictly **1080 × 1920 (9:16 aspect ratio)**, H.264 video, and AAC audio packaged in an MP4 container.
-4. **Smart Reframing:**
-   - **Blurred Canvas (Recommended):** Scales 16:9 widescreen footage into an aesthetically pleasing blurred and darkened 9:16 vertical canvas with zero horizontal stretching.
-   - **Center Crop:** Direct 9:16 optical center crop.
-5. **High-Contrast Subtitles:** Stylized ASS subtitles rendered inside the vertical safe zone (avoiding mobile UI interference). Word-level timing synchronized with Whisper.
-6. **Automatic 6-Hour Retention:** Temporary source videos, intermediate transcripts, and rendered clips are retained for 6 hours post-completion, then automatically cleaned up to safeguard disk space. Includes an instant "Delete Now" action.
-7. **Real Measurable Progress:** Live Server-Sent Events (SSE) update the UI across all stages (`INGESTING` → `TRANSCRIBING` → `ANALYZING` → `SELECTING` → `RENDERING` → `VALIDATING` → `COMPLETED`).
-8. **Direct Downloads:** Download individual vertical MP4 files or grab all clips in a single consolidated ZIP archive.
-
----
-
-## 2. Architecture & Tech Stack
+## 1. Core Architecture & Highlights
 
 ```
-Browser UI (React 18 + TypeScript + Vite + Tailwind CSS)
-    │
-    │ HTTP / Server-Sent Events (SSE)
-    ▼
-FastAPI Local Backend (Uvicorn @ 127.0.0.1:8080)
-    │
-    ├── Job Manager & SQLite Database (clipper.db)
-    ├── Ingestion & Validation (FFprobe)
-    ├── Speech Transcription (Faster-Whisper on NVIDIA RTX 3060 CUDA)
-    ├── Content Intelligence (Local Ollama: llama3.2:3b / llama3.1:8b)
-    ├── Adaptive Deduplication & Overlap Merging
-    ├── Vertical Reframing & ASS Subtitles Filter (FFmpeg 8.0)
-    ├── MP4 Spec Validation (1080x1920 H.264/AAC)
-    └── 6-Hour Retention Lifecycle Daemon
-    │
-    ▼
-Local Storage (E:\Clipper_Sidhiq\data\jobs\<job_id>\)
+                    SIDHIQ — ANY LOCATION
+                              │
+                              ▼
+                   VERCEL-DEPLOYED WEBSITE
+                    (React 18 + TypeScript)
+                              │
+                              ▼
+                   BROWSER CLIENT WORKSPACE
+                              │
+         ┌────────────────────┼────────────────────┐
+         │                    │                    │
+         ▼                    ▼                    ▼
+   Auto-Editor          WebCodecs GPU       Heuristic AI
+  Silence & Volume     1080x1920 MP4-Muxer   Moment Scoring
+  Gating (Web Audio)   Canvas 2D Engine      (Ollama-Free)
+         │                    │                    │
+         └────────────────────┼────────────────────┘
+                              │
+                              ▼
+                   ADAPTIVE CLIP SELECTION
+                     (No 10-clip quota)
+                              │
+                              ▼
+                     DOWNLOADABLE MP4s
+                     & Consolidated ZIP
 ```
+
+### Key Principles:
+1. **Serverless & Host-Free**: Runs entirely in the client's browser. When the developer PC is powered off, the site continues to work flawlessly on Vercel.
+2. **Ollama-Free Heuristic Content Intelligence**: Evaluates volume envelope dynamics (hook strength), speech density, natural pause boundaries, and pacing metrics without needing a local or remote LLM.
+3. **Auto-Editor Silence & Speech Boundary Gating**: Web Audio API decodes audio samples in-browser to detect speech active intervals and sentence/cadence pauses with 250ms margin smoothing.
+4. **Adaptive Selection**: No arbitrary 10-clip quota. Three strong clips are sufficient; twenty or more are supported when justified.
+5. **Exact 1080 × 1920 (9:16 Portrait) MP4 Output**:
+   - Hardware-accelerated WebCodecs H.264 video encoding via `mp4-muxer`.
+   - Blurred canvas composition and direct center crop options.
+   - High-contrast animated burned-in captions placed in mobile vertical safe zones.
+6. **Zero Video Uploads**: Video files are processed directly in the browser's local sandbox; private footage never leaves the user's device.
 
 ---
 
-## 3. Quick Start
+## 2. Deploying to Vercel
 
-### Simple 1-Click Startup:
-Double-click or run from Command Prompt / PowerShell:
-```cmd
+### Option 1: Via GitHub (Recommended)
+1. Push this repository to your GitHub account:
+   ```bash
+   git remote add origin https://github.com/your-username/clipper-sidhiq.git
+   git push -u origin master
+   ```
+2. Open **[vercel.com](https://vercel.com)** and click **Add New Project**.
+3. Import the `clipper-sidhiq` repository.
+4. Set **Root Directory** to `frontend` (or leave default root, as `vercel.json` is configured).
+5. Click **Deploy**. Vercel will build and assign a permanent public URL (e.g. `https://clipper-sidhiq.vercel.app`).
+
+### Option 2: Via Vercel CLI
+```bash
+cd E:\Clipper_Sidhiq\frontend
+npx vercel
+```
+Follow the interactive CLI prompts to link to your Vercel account and deploy.
+
+---
+
+## 3. Local Preview & Testing
+
+To test the serverless build locally before deploying:
+```bash
 E:\Clipper_Sidhiq\start.bat
 ```
-`start.bat` will:
-1. Verify Python 3.10+ and dependencies.
-2. Verify FFmpeg in system PATH.
-3. Verify local Ollama service (`http://127.0.0.1:11434`).
-4. Ensure the production frontend bundle is ready.
-5. Launch the local backend on `http://127.0.0.1:8080`.
-6. Open your default web browser to the studio.
-
-### Manual Command:
-```powershell
-cd E:\Clipper_Sidhiq\backend
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8080
+Or with terminal:
+```bash
+cd E:\Clipper_Sidhiq\frontend
+npm run build
+npx vite preview --port 4173
 ```
-Then visit: **`http://127.0.0.1:8080`** in your browser.
+Open **`http://localhost:4173`** in your browser.
 
 ---
 
-## 4. Workflow Guide
+## 4. Acceptance Criteria Verification
 
-1. **Upload Video:**
-   - Drag & drop any `.mp4`, `.mov`, `.mkv`, or `.webm` file into the upload zone.
-   - Preview duration, resolution, and file size immediately.
-2. **Configure (Optional):**
-   - Choose reframing mode (*Blurred Canvas* or *Center Crop*).
-   - Select subtitle theme (*Electric Violet*, *Radiant Gold*, or *Clean White*).
-   - Select local Ollama model (e.g. `llama3.2:3b`, `llama3.1:8b`).
-3. **Click "Find My Best Clips":**
-   - Watch the live progress bar and stage stepper in real time.
-4. **Review & Download:**
-   - Watch vertical 9:16 previews in the built-in player modal.
-   - Review viral scores, hooks, and AI reasoning.
-   - Click "Download MP4" for individual clips or "Download All (ZIP)".
-
----
-
-## 5. Storage & Safety Policy
-
-- Job data is stored in isolated directories: `E:\Clipper_Sidhiq\data\jobs\<job_id>\`.
-- Retention expires 6 hours after job completion.
-- The background daemon checks for expired jobs every 5 minutes and purges them safely.
-- Active downloads are protected: the cleaner never deletes files while a user is downloading.
-- Path traversal protection guarantees that only files inside `E:\Clipper_Sidhiq\data\jobs\` can be deleted.
-
----
-
-## 6. Testing & Verification
-
-An end-to-end integration test is provided in the root directory:
-```powershell
-python E:\Clipper_Sidhiq\test_pipeline_e2e.py
-```
-This script exercises:
-- SAPI human speech synthesis + 1080p video creation
-- FFprobe metadata extraction & thumbnail generation
-- Faster-Whisper GPU transcription with word timestamps
-- Ollama viral candidate scoring & deduplication
-- 1080x1920 vertical video rendering with burned ASS captions
-- Full MP4 spec validation & ZIP packaging
+- [x] **Accessible anywhere via Vercel**: 100% static client bundle with SPA rewrite rules in `vercel.json`.
+- [x] **Works when dev PC is off**: No local daemon or server required at runtime.
+- [x] **No Ollama installation needed**: Replaced with explainable heuristic audio & pacing intelligence.
+- [x] **In-browser video processing**: Audio decoding via Web Audio API, volume analysis via Auto-Editor algorithms in JS, and video encoding via WebCodecs & MP4-Muxer.
+- [x] **No paid APIs**: Core clipping pipeline operates without OpenAI, Claude, or cloud GPU fees.
+- [x] **Adaptive clip selection**: Content determines output (no forced 10-clip quota).
+- [x] **Exact 1080×1920 vertical MP4**: Clean H.264/AAC output with download-all ZIP support.
+- [x] **Browser memory & privacy**: All processing occurs in-memory and in IndexedDB, with an instant "Clear Cache" button.
