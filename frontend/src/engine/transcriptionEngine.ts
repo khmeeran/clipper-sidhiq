@@ -72,22 +72,8 @@ export async function transcribeInBrowser(
     const dur = seg.end - seg.start;
     if (dur < 0.6) return; // Skip tiny clicks
 
-    // Construct natural caption phrase timing
-    const dummyWordsCount = Math.max(2, Math.min(10, Math.round(dur * 2.8))); // ~2.8 words/sec typical speech rate
-    const step = dur / dummyWordsCount;
-
     const words: TranscriptWord[] = [];
-    for (let w = 0; w < dummyWordsCount; w++) {
-      const wStart = Number((seg.start + w * step).toFixed(2));
-      const wEnd = Number((wStart + step * 0.9).toFixed(2));
-      words.push({
-        word: `[Moment ${idx + 1}]`,
-        start: wStart,
-        end: wEnd
-      });
-    }
-
-    const text = `Key moment from sequence ${idx + 1}`;
+    const text = '';
     segments.push({
       id: idx + 1,
       start: seg.start,
@@ -95,7 +81,6 @@ export async function transcribeInBrowser(
       text,
       words
     });
-    fullTextParts.push(text);
   });
 
   onProgress?.(100, `Synchronized ${segments.length} dialogue subtitle segments.`);

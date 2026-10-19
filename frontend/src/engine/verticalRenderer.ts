@@ -557,7 +557,7 @@ function drawVerticalFrame(
       s => currentTime >= s.start && currentTime <= s.end
     );
 
-    if (activeSeg) {
+    if (activeSeg && activeSeg.text && activeSeg.text.trim().length > 0) {
       ctx.save();
       ctx.textAlign = 'center';
       ctx.textBaseline = 'bottom';
