@@ -10,7 +10,12 @@ import {
   Maximize2,
   HardDrive,
   ShieldCheck,
-  Zap
+  Zap,
+  Link as LinkIcon,
+  Globe,
+  ArrowRight,
+  Loader2,
+  HelpCircle
 } from 'lucide-react';
 import { BrowserSystemStatus, ClientSettings } from '../types';
 
@@ -32,6 +37,12 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
   const [videoPreview, setVideoPreview] = useState<{ duration: number; width: number; height: number } | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   
+  // Ingestion Mode: Local File vs Paste Video URL
+  const [uploadMode, setUploadMode] = useState<'local' | 'url'>('local');
+  const [videoUrl, setVideoUrl] = useState('');
+  const [isFetchingUrl, setIsFetchingUrl] = useState(false);
+  const [fetchProgress, setFetchProgress] = useState<{ percent: number; loaded: number; total: number } | null>(null);
+
   // Custom job preferences
   const [reframingMode, setReframingMode] = useState<'blur_background' | 'center_crop'>(settings.reframing_mode || 'blur_background');
   const [subtitleStyle, setSubtitleStyle] = useState<'violet_glow' | 'radiant_gold' | 'clean_white'>(settings.subtitle_style || 'violet_glow');
@@ -39,6 +50,115 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleFetchUrl = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    setErrorMessage(null);
+    const trimmed = videoUrl.trim();
+
+    if (!trimmed) {
+      setErrorMessage('Please enter a video URL.');
+      return;
+    }
+
+    if (!/^https?:\/\//i.test(trimmed)) {
+      setErrorMessage('Please enter a valid URL starting with http:// or https://');
+      return;
+    }
+
+    const lower = trimmed.toLowerCase();
+    if (lower.includes('youtube.com') || lower.includes('youtu.be')) {
+      setErrorMessage(
+        'YouTube watch URLs are streaming webpages, not direct video files. Modern web browsers cannot fetch raw YouTube streams directly due to platform security and CORS. Please download the video file to your computer first and use the Local File Upload tab.'
+      );
+      return;
+    }
+
+    if (['vimeo.com', 'instagram.com', 'tiktok.com', 'twitter.com', 'x.com', 'facebook.com'].some(d => lower.includes(d))) {
+      setErrorMessage(
+        'Social and video streaming platforms restrict direct browser media access (CORS & DRM). Please download the video file locally and use the Local File Upload tab.'
+      );
+      return;
+    }
+
+    setIsFetchingUrl(true);
+    setFetchProgress(null);
+
+    try {
+      const response = await fetch(trimmed, {
+        method: 'GET',
+        mode: 'cors'
+      });
+
+      if (!response.ok) {
+        throw new Error(`Server returned HTTP ${response.status} (${response.statusText || 'Error'}). Please verify the link or file permissions.`);
+      }
+
+      const contentType = (response.headers.get('content-type') || '').toLowerCase();
+      const hasVideoExt = /\.(mp4|mov|webm|mkv|avi|m4v)(\?.*)?$/i.test(trimmed);
+      if (contentType && !contentType.startsWith('video/') && !contentType.includes('octet-stream') && !hasVideoExt) {
+        throw new Error(
+          `The provided URL returned content type '${contentType}', which does not appear to be a direct video stream. Ensure this is a direct link to an MP4, MOV, or WebM file.`
+        );
+      }
+
+      const contentLengthHeader = response.headers.get('content-length');
+      const totalBytes = contentLengthHeader ? parseInt(contentLengthHeader, 10) : 0;
+
+      const chunks: Uint8Array[] = [];
+      let loadedBytes = 0;
+
+      if (response.body && typeof response.body.getReader === 'function') {
+        const reader = response.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) {
+            chunks.push(value);
+            loadedBytes += value.length;
+            const pct = totalBytes > 0 ? Math.min(100, Math.round((loadedBytes / totalBytes) * 100)) : 0;
+            setFetchProgress({ percent: pct, loaded: loadedBytes, total: totalBytes });
+          }
+        }
+      } else {
+        const buffer = await response.arrayBuffer();
+        chunks.push(new Uint8Array(buffer));
+        loadedBytes = buffer.byteLength;
+      }
+
+      if (loadedBytes < 1024) {
+        throw new Error('The downloaded file is less than 1 KB and is not a valid video.');
+      }
+
+      // Extract filename from URL
+      let filename = 'remote_video.mp4';
+      try {
+        const urlObj = new URL(trimmed);
+        const namePart = urlObj.pathname.split('/').pop();
+        if (namePart && namePart.includes('.')) {
+          filename = decodeURIComponent(namePart.split('?')[0]);
+        }
+      } catch (_) {}
+
+      const inferredMime = contentType.startsWith('video/') ? contentType : 'video/mp4';
+      const file = new File(chunks as any, filename, { type: inferredMime });
+
+      handleFileSelect(file);
+      setVideoUrl('');
+    } catch (err: any) {
+      console.error('URL video fetch failed:', err);
+      if (err.name === 'TypeError' && err.message?.toLowerCase().includes('failed to fetch')) {
+        setErrorMessage(
+          'Browser CORS Blocked: The remote server hosting this video does not allow cross-origin requests from other web pages. Modern browsers block this for security. Fallback: Download the video file to your computer and use the Local File Upload tab.'
+        );
+      } else {
+        setErrorMessage(err.message || 'Failed to retrieve video from the specified URL.');
+      }
+    } finally {
+      setIsFetchingUrl(false);
+      setFetchProgress(null);
+    }
+  };
 
   const handleFileSelect = (file: File) => {
     setErrorMessage(null);
@@ -129,7 +249,136 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
         </p>
       </div>
 
-      {/* Upload Box */}
+      {/* Ingestion Mode Selector Tabs */}
+      {!selectedFile && (
+        <div className="flex items-center justify-center">
+          <div className="inline-flex p-1 rounded-xl bg-[#0e1017] border border-white/5 shadow-inner">
+            <button
+              type="button"
+              onClick={() => {
+                setUploadMode('local');
+                setErrorMessage(null);
+              }}
+              className={`flex items-center space-x-2 px-5 py-2 rounded-lg text-xs font-semibold transition-all ${
+                uploadMode === 'local'
+                  ? 'bg-purple-600 text-white shadow-md shadow-purple-600/25'
+                  : 'text-gray-400 hover:text-gray-200'
+              }`}
+            >
+              <UploadCloud className="w-3.5 h-3.5" />
+              <span>Local File Upload</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setUploadMode('url');
+                setErrorMessage(null);
+              }}
+              className={`flex items-center space-x-2 px-5 py-2 rounded-lg text-xs font-semibold transition-all ${
+                uploadMode === 'url'
+                  ? 'bg-purple-600 text-white shadow-md shadow-purple-600/25'
+                  : 'text-gray-400 hover:text-gray-200'
+              }`}
+            >
+              <LinkIcon className="w-3.5 h-3.5" />
+              <span>Paste Video URL</span>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* URL Video Ingestion Card */}
+      {uploadMode === 'url' && !selectedFile && (
+        <div className="rounded-2xl p-8 bg-[#0e1017] border border-white/10 space-y-6 shadow-xl">
+          <div className="text-center space-y-2">
+            <div className="w-12 h-12 mx-auto rounded-xl bg-purple-500/10 border border-purple-500/20 flex items-center justify-center text-purple-400">
+              <Globe className="w-6 h-6" />
+            </div>
+            <h3 className="text-lg font-semibold text-white">Direct Video URL Ingestion</h3>
+            <p className="text-xs text-gray-400 max-w-lg mx-auto">
+              Provide a direct link to an MP4, MOV, or WebM file. The video is fetched directly by your browser into local memory with zero cloud servers.
+            </p>
+          </div>
+
+          <form onSubmit={handleFetchUrl} className="space-y-4 max-w-2xl mx-auto">
+            <div className="flex flex-col sm:flex-row gap-3">
+              <div className="relative flex-1">
+                <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-gray-500">
+                  <LinkIcon className="w-4 h-4" />
+                </div>
+                <input
+                  type="url"
+                  value={videoUrl}
+                  onChange={(e) => setVideoUrl(e.target.value)}
+                  placeholder="https://example.com/sample_video.mp4"
+                  disabled={isFetchingUrl}
+                  className="w-full pl-10 pr-4 py-3 bg-[#141620] border border-white/10 rounded-xl text-sm text-white placeholder-gray-500 focus:outline-none focus:border-purple-500 transition-colors disabled:opacity-50"
+                />
+              </div>
+
+              <button
+                type="submit"
+                disabled={isFetchingUrl || !videoUrl.trim()}
+                className="px-6 py-3 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-semibold text-sm shadow-lg shadow-purple-600/25 flex items-center justify-center space-x-2 transition-all active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0"
+              >
+                {isFetchingUrl ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <span>Fetching...</span>
+                  </>
+                ) : (
+                  <>
+                    <span>Fetch Video</span>
+                    <ArrowRight className="w-4 h-4" />
+                  </>
+                )}
+              </button>
+            </div>
+
+            {/* Fetch Progress Bar */}
+            {isFetchingUrl && (
+              <div className="space-y-2 p-4 rounded-xl bg-[#141620] border border-white/5">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-purple-300 font-medium">Downloading video into browser memory...</span>
+                  <span className="font-mono text-gray-400">
+                    {fetchProgress && fetchProgress.total > 0
+                      ? `${fetchProgress.percent}% (${formatBytes(fetchProgress.loaded)} / ${formatBytes(fetchProgress.total)})`
+                      : fetchProgress
+                      ? `${formatBytes(fetchProgress.loaded)} received`
+                      : 'Connecting...'}
+                  </span>
+                </div>
+                <div className="w-full bg-white/5 rounded-full h-2 overflow-hidden">
+                  <div
+                    className="bg-gradient-to-r from-purple-500 to-cyan-400 h-full transition-all duration-150"
+                    style={{ width: `${fetchProgress?.percent || 25}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* Capability & CORS Notes */}
+            <div className="p-4 rounded-xl bg-white/[0.02] border border-white/5 space-y-2 text-xs text-gray-400">
+              <div className="flex items-start space-x-2">
+                <HelpCircle className="w-4 h-4 text-purple-400 flex-shrink-0 mt-0.5" />
+                <div className="space-y-1">
+                  <p className="text-gray-300 font-medium">Supported URL Types:</p>
+                  <p className="text-gray-400 leading-relaxed">
+                    Direct media links to <code className="text-purple-300 bg-white/5 px-1 py-0.5 rounded">.mp4</code>, <code className="text-purple-300 bg-white/5 px-1 py-0.5 rounded">.mov</code>, or <code className="text-purple-300 bg-white/5 px-1 py-0.5 rounded">.webm</code> hosted on CORS-permissive servers (e.g. AWS S3, Cloudflare R2, GitHub releases, open web archives, public CDNs).
+                  </p>
+                  <p className="text-gray-500 pt-1 leading-relaxed">
+                    <strong className="text-gray-400">Streaming Platforms:</strong> YouTube, Vimeo, Instagram, and TikTok block browser fetching via CORS and DRM. To process content from those platforms, download the file to your computer first and use the <strong>Local File Upload</strong> tab.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Local Upload Box or Selected Video Configuration */}
+      {(uploadMode === 'local' || selectedFile) && (
       <div
         onDragEnter={handleDrag}
         onDragOver={handleDrag}
@@ -285,11 +534,26 @@ export const UploadWorkspace: React.FC<UploadWorkspaceProps> = ({
           </div>
         )}
       </div>
+      )}
 
       {errorMessage && (
-        <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-300 text-sm flex items-center space-x-2.5">
-          <AlertCircle className="w-5 h-5 flex-shrink-0 text-rose-400" />
-          <span>{errorMessage}</span>
+        <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-300 text-sm flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+          <div className="flex items-start space-x-2.5">
+            <AlertCircle className="w-5 h-5 flex-shrink-0 text-rose-400 mt-0.5" />
+            <span className="leading-relaxed">{errorMessage}</span>
+          </div>
+          {uploadMode === 'url' && (
+            <button
+              type="button"
+              onClick={() => {
+                setUploadMode('local');
+                setErrorMessage(null);
+              }}
+              className="px-3 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 text-xs font-semibold border border-rose-500/30 whitespace-nowrap transition-colors flex-shrink-0"
+            >
+              Switch to Local Upload
+            </button>
+          )}
         </div>
       )}
 
