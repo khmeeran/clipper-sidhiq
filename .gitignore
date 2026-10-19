@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+
+# Local data & temporary caches
+data/
+test_data/
+backup_server_mvp/
+.vite/
+dist/
+
+# Logs & environment
+*.log
+.env
+.env.local
+.DS_Store
+
+# Vercel
+.vercel/
